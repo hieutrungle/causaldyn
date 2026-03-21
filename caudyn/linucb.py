@@ -47,17 +47,62 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from environment import UberMarketplaceEnvironment # Importing our Phase 1 world
+from sklearn.linear_model import Ridge
 
 class LinUCBAgent:
-    def __init__(self, n_actions, n_features, alpha=1.0):
+    # We add prior_weight to the initialization
+    def __init__(self, n_actions, n_features, alpha=1.0, prior_weight=1000.0):
         self.n_actions = n_actions
         self.n_features = n_features
-        self.alpha = alpha # The Exploration parameter
+        self.alpha = alpha
         
-        # Initialize the A matrix (covariance) and b vector (rewards) for each arm
-        # A is initialized as an Identity matrix (Ridge regression prior)
-        self.A = [np.identity(n_features) for _ in range(n_actions)]
+        # A is now initialized with our prior_weight instead of just 1.0
+        # A higher prior_weight means the Bandit is less likely to overwrite
+        # the offline intelligence during early exploration.
+        self.A = [np.identity(n_features) * prior_weight for _ in range(n_actions)]
         self.b = [np.zeros(n_features) for _ in range(n_actions)]
+
+    def inject_offline_prior(self, historical_df, model_y, cate_model, discount_levels):
+        """
+        Distills the Phase 2 Random Forests into linear weights and injects them.
+        """
+        print("-> Distilling Phase 2 R-Learner into LinUCB Priors...")
+        
+        features = ['recency', 'frequency', 'weather_active', 'surge_multiplier']
+        X_raw = historical_df[features]
+        
+        # 1. Ask the offline models for the baseline and the CATE
+        baseline_preds = model_y.predict(X_raw)
+        cate_preds = cate_model.predict(X_raw)
+        
+        # We need to format the data exactly how the Bandit sees it (with the Intercept)
+        X_bandit = np.array([
+            np.ones(len(historical_df)),
+            historical_df['recency'] / 30.0,
+            historical_df['frequency'] / 20.0,
+            historical_df['weather_active'],
+            historical_df['surge_multiplier'] / 3.0
+        ]).T
+        
+        # 2. For each arm, calculate the expected rewards and run a Ridge Regression
+        for a in range(self.n_actions):
+            discount = discount_levels[a]
+            
+            # The R-Learner's prediction of reality for this specific arm
+            expected_rewards = baseline_preds + (cate_preds * discount)
+            
+            # Fit a linear model to distill the Random Forest logic into linear weights
+            # We don't fit an intercept because we already included a column of 1s in X_bandit
+            distillation_model = Ridge(fit_intercept=False, alpha=1.0)
+            distillation_model.fit(X_bandit, expected_rewards)
+            
+            theta_prior = distillation_model.coef_
+            
+            # 3. Inject the prior into the Bandit's brain
+            # b = A * theta_prior
+            self.b[a] = self.A[a].dot(theta_prior)
+            
+            print(f"   Arm {a} Prior Injected successfully.")
         
     def _get_context_vector(self, state_dict):
         """
