@@ -111,6 +111,87 @@ class UberMarketplaceEnvironment:
             data.append(row)
             
         return pd.DataFrame(data)
+
+
+class UberMarketplaceEnvironmentWithShock(UberMarketplaceEnvironment):
+    """
+    Extended environment that simulates a macroeconomic shock at a specific step.
+    
+    Before the shock: Baseline economics (good economy, weak discount effect)
+    After the shock: Riders become frugal, base conversion crashes, discount sensitivity skyrockets
+    
+    This simulates non-stationary environments and tests algorithm adaptability.
+    """
+    
+    def __init__(self, seed=42, shock_step=17500):
+        super().__init__(seed=seed)
+        
+        # Track the current simulation step for shock timing
+        self.current_step = 0
+        self.shock_step = shock_step  # The exact moment the economy crashes
+
+    def step(self, action_idx):
+        """Applies a discount, observes the outcome, and returns the reward."""
+        if self.current_state is None:
+            raise ValueError("Call reset() before step()")
+            
+        # Calculate true hidden probability (now aware of the current step)
+        true_prob = self._calculate_true_conversion(self.current_state, action_idx)
+        
+        # Flip a biased coin to see if they actually booked the ride
+        reward = self.np_random.binomial(1, true_prob)
+        
+        # Increment our global clock
+        self.current_step += 1
+        
+        # In a Bandit, every step is a new episode. We return the reward and a new state.
+        next_state = self.reset()
+        
+        return next_state, reward, true_prob
+
+    def _calculate_true_conversion(self, context, action_idx):
+        """The hidden laws of physics. Now with a built-in economic shock."""
+        discount_value = self.discount_levels[action_idx]
+        
+        # ==========================================
+        # PHASE 1: THE GOOD ECONOMY (Steps 0 to shock_step)
+        # ==========================================
+        if self.current_step < self.shock_step:
+            # Pre-shock: Original baseline economics
+            base_prob = 0.2 \
+                        + (0.04 * context['frequency']) \
+                        - (0.01 * context['recency']) \
+                        + (0.10 * context['weather_active']) \
+                        - (0.10 * context['surge_multiplier'])
+            
+            # Discounts are weakly effective, mostly for infrequent riders
+            treatment_multiplier = 0.5 - (0.10 * context['frequency']) + (0.04 * context['recency'])
+            
+        # ==========================================
+        # PHASE 2: THE ECONOMIC SHOCK (Steps shock_step+)
+        # ==========================================
+        else:
+            # 1. Softer post-shock baseline: average conversion around 10-15%.
+            base_prob = 0.15 \
+                        + (0.01 * context['frequency']) \
+                        - (0.005 * context['recency']) \
+                        + (0.05 * context['weather_active']) \
+                        - (0.05 * context['surge_multiplier'])
+
+            # 2. Discounts are uniformly harmful after the shock.
+            treatment_multiplier = -0.8
+
+        # Keep pre-shock behavior unchanged (discounts weakly positive at best).
+        if self.current_step < self.shock_step:
+            treatment_multiplier = max(0, treatment_multiplier)
+            treatment_effect = discount_value * treatment_multiplier
+        else:
+            treatment_effect = discount_value * treatment_multiplier
+        
+        # Final Probability
+        final_prob = np.clip(base_prob + treatment_effect, 0.0, 1.0)
+        return final_prob
+
     
 if __name__ == "__main__":
     print("1. Instantiating the Marketplace Environment...")
