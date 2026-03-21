@@ -44,14 +44,19 @@ Execution Loop:
 
 
 import numpy as np
-import pandas as pd
 import matplotlib.pyplot as plt
-from environment import UberMarketplaceEnvironment # Importing our Phase 1 world
+import time
 from sklearn.linear_model import Ridge
 
+try:
+    from environment import UberMarketplaceEnvironment # Script execution mode
+except ImportError:
+    from .environment import UberMarketplaceEnvironment # Package import mode
+
 class LinUCBAgent:
-    # We add prior_weight to the initialization
-    def __init__(self, n_actions, n_features, alpha=1.0, prior_weight=1000.0):
+    """Original LinUCB agent with explicit covariance matrices."""
+
+    def __init__(self, n_actions, n_features, alpha=1.0, prior_weight=1.0):
         self.n_actions = n_actions
         self.n_features = n_features
         self.alpha = alpha
@@ -120,7 +125,7 @@ class LinUCBAgent:
 
     def choose_action(self, state_dict):
         x = self._get_context_vector(state_dict)
-        p = np.zeros(self.n_actions)
+        ucb_scores = np.zeros(self.n_actions)
         
         for a in range(self.n_actions):
             # Calculate A inverse
@@ -136,12 +141,12 @@ class LinUCBAgent:
             exploration_bonus = self.alpha * np.sqrt(x.dot(A_inv).dot(x))
             
             # Upper Confidence Bound
-            p[a] = expected_reward + exploration_bonus
+            ucb_scores[a] = expected_reward + exploration_bonus
             
         # Break ties randomly, otherwise pick the max UCB
         # np.isclose is used to handle floating point precision ties
-        max_ucb = np.max(p)
-        best_actions = np.where(np.isclose(p, max_ucb))[0]
+        max_ucb = np.max(ucb_scores)
+        best_actions = np.where(np.isclose(ucb_scores, max_ucb))[0]
         return np.random.choice(best_actions)
 
     def update(self, action, state_dict, reward):
@@ -155,114 +160,248 @@ class LinUCBAgent:
         A_inv = np.linalg.inv(self.A[action])
         return A_inv.dot(self.b[action])
 
-# =====================================================================
-# THE ONLINE SIMULATION RUNNER
-# =====================================================================
-if __name__ == "__main__":
-    env = UberMarketplaceEnvironment(seed=100)
-    
-    # 3 Actions (0%, 10%, 20%), 5 Features (Intercept, Recency, Freq, Weather, Surge)
-    agent = LinUCBAgent(n_actions=3, n_features=5, alpha=0.5)
-    
-    n_steps = 15000
-    cumulative_rewards = 0
+class FastLinUCBAgent(LinUCBAgent):
+    """Discounted LinUCB using Sherman-Morrison inverse updates."""
+
+    def __init__(self, n_actions, n_features, alpha=1.0, gamma=0.995, prior_weight=1.0):
+        super().__init__(n_actions=n_actions, n_features=n_features, alpha=alpha, prior_weight=prior_weight)
+        self.gamma = gamma # The Discount/Forgetting factor (0 < gamma <= 1)
+
+        # Keep direct inverse matrices for fast O(d^2) updates.
+        self.A_inv = [np.linalg.inv(a_matrix) for a_matrix in self.A]
+
+    def inject_offline_prior(self, historical_df, model_y, cate_model, discount_levels):
+        """Injects priors and keeps inverse matrices synchronized."""
+        super().inject_offline_prior(historical_df, model_y, cate_model, discount_levels)
+        self.A_inv = [np.linalg.inv(a_matrix) for a_matrix in self.A]
+
+    def choose_action(self, state_dict):
+        x = self._get_context_vector(state_dict)
+        ucb_scores = np.zeros(self.n_actions)
+        
+        for a in range(self.n_actions):
+            # We no longer compute the inverse from scratch.
+            A_inv_a = self.A_inv[a]
+            
+            # Calculate theta (the learned causal weights for this specific arm)
+            theta_a = A_inv_a.dot(self.b[a])
+            
+            # Calculate the expected reward (Exploitation)
+            expected_reward = theta_a.dot(x)
+            
+            # Calculate the confidence bound (Exploration)
+            exploration_bonus = self.alpha * np.sqrt(x.dot(A_inv_a).dot(x))
+            
+            # Upper Confidence Bound
+            ucb_scores[a] = expected_reward + exploration_bonus
+            
+        # Break ties randomly, otherwise pick the max UCB
+        max_ucb = np.max(ucb_scores)
+        best_actions = np.where(np.isclose(ucb_scores, max_ucb))[0]
+        return np.random.choice(best_actions)
+
+    def update(self, action, state_dict, reward):
+        """Updates the inverse covariance matrix and reward vector directly."""
+        x = self._get_context_vector(state_dict)
+        
+        # 1. Decay and update the reward vector
+        self.b[action] = (self.gamma * self.b[action]) + (reward * x)
+        
+        # 2. Sherman-Morrison Update for the Inverse Matrix with Discounting
+        # The math: M_new = (1/gamma) * [ M - (M * x * x^T * M) / (gamma + x^T * M * x) ]
+        M = self.A_inv[action]
+        
+        # Step A: Calculate M * x  (This is an O(d^2) operation)
+        Mx = M.dot(x) 
+        
+        # Step B: Calculate the denominator (scalar)
+        denominator = self.gamma + x.dot(Mx)
+        
+        # Step C: Calculate the numerator (outer product of Mx with itself)
+        numerator = np.outer(Mx, Mx)
+        
+        # Step D: Apply the update rule
+        self.A_inv[action] = (1.0 / self.gamma) * (M - (numerator / denominator))
+
+        # Keep A synchronized for compatibility with shared/base logic.
+        self.A[action] = (self.gamma * self.A[action]) + np.outer(x, x)
+
+    def get_learned_weights(self, action):
+        """Helper to peek into the Bandit's brain."""
+        # No inversion needed here either
+        return self.A_inv[action].dot(self.b[action])
+
+
+def run_agent_simulation(agent_class, env_seed=100, n_steps=15000, progress_every=5000, **agent_kwargs):
+    """Runs one full simulation and returns metrics for the given agent class."""
+    env = UberMarketplaceEnvironment(seed=env_seed)
+    agent = agent_class(n_actions=3, n_features=5, **agent_kwargs)
+
+    cumulative_rewards = 0.0
     reward_history = []
-    cumulative_regret = 0
+    cumulative_true_conversion = 0.0
+    true_conversion_history = []
+    cumulative_oracle_conversion = 0.0
+    oracle_conversion_history = []
+    cumulative_regret = 0.0
     regret_history = []
     mse_history = []
-    
-    print(f"1. Launching LinUCB Online Simulation for {n_steps} riders...")
-    
+
+    print(f"\n1. Launching {agent_class.__name__} online simulation for {n_steps} riders...")
+    start_time = time.perf_counter()
+
     state = env.reset()
     for step in range(n_steps):
-        # 1. Agent chooses action based on Context
         action = agent.choose_action(state)
-        
-        # =========================================================
-        # THE ORACLE (Ground Truth Evaluation)
-        # We calculate the true probabilities for ALL arms to grade the Bandit
-        # =========================================================
+
+        # Oracle grading against all possible actions.
         true_probs = [env._calculate_true_conversion(state, a) for a in range(agent.n_actions)]
-        
-        # Oracle's best action and reward
         optimal_prob = np.max(true_probs)
-        
-        # Bandit's chosen reward
         chosen_prob = true_probs[action]
-        
-        # Metric 1: Regret (How much conversion did we lose by not being perfect?)
+
+        cumulative_true_conversion += chosen_prob
+        true_conversion_history.append(cumulative_true_conversion / (step + 1))
+        cumulative_oracle_conversion += optimal_prob
+        oracle_conversion_history.append(cumulative_oracle_conversion / (step + 1))
+
         step_regret = optimal_prob - chosen_prob
         cumulative_regret += step_regret
         regret_history.append(cumulative_regret)
-        
-        # Metric 2: Prediction Error (How far off was the Bandit's internal math?)
+
         x = agent._get_context_vector(state)
         bandit_prediction = agent.get_learned_weights(action).dot(x)
-        squared_error = (bandit_prediction - chosen_prob)**2
+        squared_error = (bandit_prediction - chosen_prob) ** 2
         mse_history.append(squared_error)
-        
-        # =========================================================
-        
-        # 2. Environment reacts
+
         next_state, reward, _ = env.step(action)
-        
-        # 3. Agent learns from the outcome
         agent.update(action, state, reward)
-        
-        # Track metrics
+
         cumulative_rewards += reward
         reward_history.append(cumulative_rewards / (step + 1))
-        
         state = next_state
-        
-        if (step + 1) % 5000 == 0:
+
+        if (step + 1) % progress_every == 0:
+            current_rmse = np.sqrt(np.mean(mse_history[-progress_every:]))
             print(f"   -> Step {step + 1}: Average Conversion Rate = {reward_history[-1]:.1%}")
-            current_rmse = np.sqrt(np.mean(mse_history[-5000:]))
-            print(f"   -> Step {step + 1}:")
             print(f"      Cumulative Regret: {cumulative_regret:.2f}")
             print(f"      Recent Prediction RMSE: {current_rmse:.4f}")
 
-    print("\n2.1. Peeking into the Bandit's Brain (Learned Weights)...")
+    runtime_seconds = time.perf_counter() - start_time
+
+    return {
+        "agent_name": agent_class.__name__,
+        "agent": agent,
+        "env": env,
+        "reward_history": reward_history,
+        "true_conversion_history": true_conversion_history,
+        "oracle_conversion_history": oracle_conversion_history,
+        "regret_history": regret_history,
+        "mse_history": mse_history,
+        "avg_conversion": reward_history[-1],
+        "avg_true_conversion": true_conversion_history[-1],
+        "avg_oracle_conversion": oracle_conversion_history[-1],
+        "cumulative_regret": cumulative_regret,
+        "final_rmse": float(np.sqrt(np.mean(mse_history[-progress_every:]))),
+        "runtime_seconds": runtime_seconds,
+    }
+
+
+def print_agent_weights(simulation_result):
+    """Prints learned linear weights per action for one simulation result."""
+    agent = simulation_result["agent"]
+    env = simulation_result["env"]
+    print(f"\n2. Peeking into {simulation_result['agent_name']} learned weights...")
     feature_names = ["Intercept", "Recency", "Frequency", "Weather", "Surge"]
-    
-    for a in range(3):
+
+    for a in range(agent.n_actions):
         discount = env.discount_levels[a] * 100
         weights = agent.get_learned_weights(a)
         print(f"\n--- Arm {a} ({discount}% Discount) Learned Weights ---")
         for name, weight in zip(feature_names, weights):
             print(f"  {name:10}: {weight:+.3f}")
-            
-    print("\n2.2. Evaluation Complete.")
-    print("If the RMSE drops significantly between step 5000 and 15000,")
-    print("it mathematically proves the Bandit is converging on the true hidden physics.")
 
-    print("\n3. Analysis:")
-    print("Look at the 'Frequency' weight across the three arms.")
-    print("The Bandit should have learned that giving a 20% discount (Arm 2)")
-    print("to a high-frequency user is mathematically worse or negligible compared")
-    print("to giving it to a low-frequency user.")
-    
-    # plot all the metrics in one figure
+
+def print_comparison(original_result, fast_result):
+    """Prints a concise side-by-side comparison of key metrics."""
+    print("\n3. Comparison: Original vs Fast")
+    print("   Metric                        Original          Fast")
+    print(f"   Avg Conversion                {original_result['avg_conversion']:.4f}          {fast_result['avg_conversion']:.4f}")
+    print(f"   Cumulative Regret             {original_result['cumulative_regret']:.2f}          {fast_result['cumulative_regret']:.2f}")
+    print(f"   Final RMSE                    {original_result['final_rmse']:.4f}          {fast_result['final_rmse']:.4f}")
+    print(f"   Runtime (seconds)             {original_result['runtime_seconds']:.2f}          {fast_result['runtime_seconds']:.2f}")
+
+
+def plot_comparison(original_result, fast_result):
+    """Plots side-by-side learning curves for Original and Fast LinUCB."""
+    original_color = "tab:blue"
+    fast_color = "tab:orange"
+    oracle_color = "black"
+
     plt.figure(figsize=(18, 5))
+
     plt.subplot(1, 3, 1)
-    plt.plot(reward_history, label='Average Conversion Rate')
-    plt.xlabel('Steps')
-    plt.ylabel('Average Conversion')
-    plt.title('LinUCB Average Conversion Over Time')
+    plt.plot(original_result["reward_history"], label="Original LinUCB", color=original_color)
+    plt.plot(fast_result["reward_history"], label="Fast LinUCB", color=fast_color, alpha=0.9)
+    plt.plot(
+        original_result["oracle_conversion_history"],
+        label="Ground Truth (Oracle)",
+        color=oracle_color,
+        linestyle="--",
+        linewidth=1.5,
+    )
+    plt.xlabel("Steps")
+    plt.ylabel("Average Conversion")
+    plt.title("Average Conversion vs Ground Truth")
     plt.legend()
-    
+
     plt.subplot(1, 3, 2)
-    plt.plot(regret_history, label='Cumulative Regret', color='orange')
-    plt.xlabel('Steps')
-    plt.ylabel('Cumulative Regret')
-    plt.title('LinUCB Cumulative Regret Over Time')
+    plt.plot(original_result["regret_history"], label="Original LinUCB", color=original_color)
+    plt.plot(fast_result["regret_history"], label="Fast LinUCB", color=fast_color, alpha=0.9)
+    plt.xlabel("Steps")
+    plt.ylabel("Cumulative Regret")
+    plt.title("Cumulative Regret Over Time")
     plt.legend()
-    
+
     plt.subplot(1, 3, 3)
-    plt.plot(mse_history, label='Prediction MSE', color='green')
-    plt.xlabel('Steps')
-    plt.ylabel('MSE')
-    plt.title('LinUCB Prediction MSE Over Time')
+    plt.plot(original_result["mse_history"], label="Original LinUCB", color=original_color, alpha=0.5)
+    plt.plot(fast_result["mse_history"], label="Fast LinUCB", color=fast_color, alpha=0.5)
+    plt.xlabel("Steps")
+    plt.ylabel("MSE")
+    plt.title("Prediction MSE Over Time")
     plt.legend()
+
     plt.tight_layout()
     plt.show()
+
+# =====================================================================
+# THE ONLINE SIMULATION RUNNER
+# =====================================================================
+if __name__ == "__main__":
+    n_steps = 15000
+    original_result = run_agent_simulation(
+        LinUCBAgent,
+        env_seed=100,
+        n_steps=n_steps,
+        progress_every=5000,
+        alpha=0.5,
+    )
+
+    fast_result = run_agent_simulation(
+        FastLinUCBAgent,
+        env_seed=100,
+        n_steps=n_steps,
+        progress_every=5000,
+        alpha=0.5,
+        gamma=0.995,
+    )
+
+    print_agent_weights(original_result)
+    print_agent_weights(fast_result)
+    print_comparison(original_result, fast_result)
+
+    print("\n4. Analysis:")
+    print("Look at the 'Frequency' weight across the three arms in both methods.")
+    print("Both agents should learn that 20% discount (Arm 2) for high-frequency users")
+    print("is often weak or negative compared with low-frequency users.")
+
+    plot_comparison(original_result, fast_result)
