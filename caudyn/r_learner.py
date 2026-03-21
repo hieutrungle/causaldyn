@@ -1,9 +1,81 @@
 import pandas as pd
 import numpy as np
-from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 from xgboost import XGBRegressor
 from sklearn.model_selection import cross_val_predict
 from sklearn.metrics import mean_squared_error
+
+
+class RLearner:
+    """R-learner for continuous treatment using XGBoost nuisance and CATE models.
+
+    The model fits:
+      1) mu(x) = E[Y|X]
+      2) e(x) = E[T|X]
+      3) tau(x) from weighted regression on residualized targets
+
+    Then predicts absolute outcomes as mu(x) + t * tau(x).
+    """
+
+    def __init__(self, random_state=42, cv=5, epsilon=1e-6):
+        self.random_state = random_state
+        self.cv = cv
+        self.epsilon = epsilon
+
+        self.model_y = XGBRegressor(max_depth=5, random_state=random_state)
+        self.model_t = XGBRegressor(max_depth=5, random_state=random_state)
+        self.model_tau = XGBRegressor(max_depth=5, random_state=random_state)
+
+        self._is_fitted = False
+
+    def fit(self, X, T, Y):
+        """Fits nuisance models and CATE model.
+
+        Args:
+            X: Context dataframe or numpy array (n, d)
+            T: Continuous treatment vector (n,)
+            Y: Outcome vector (n,)
+        """
+        X_df = X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
+        T_arr = np.asarray(T, dtype=float)
+        Y_arr = np.asarray(Y, dtype=float)
+
+        # Cross-fitted nuisance predictions for residualization.
+        y_hat = cross_val_predict(self.model_y, X_df, Y_arr, cv=self.cv)
+        t_hat = cross_val_predict(self.model_t, X_df, T_arr, cv=self.cv)
+
+        y_res = Y_arr - y_hat
+        t_res = T_arr - t_hat
+
+        cate_target = y_res / (t_res + self.epsilon)
+        sample_weight = (t_res ** 2) + self.epsilon
+
+        # Fit final models on full data for serving.
+        self.model_y.fit(X_df, Y_arr)
+        self.model_t.fit(X_df, T_arr)
+        self.model_tau.fit(X_df, cate_target, sample_weight=sample_weight)
+
+        self._is_fitted = True
+        return self
+
+    def predict_cate(self, X):
+        """Predicts CATE tau(x)."""
+        if not self._is_fitted:
+            raise ValueError("RLearner must be fitted before predict_cate().")
+        X_df = X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
+        return self.model_tau.predict(X_df)
+
+    def predict_mu(self, X):
+        """Predicts baseline mu(x)=E[Y|X]."""
+        if not self._is_fitted:
+            raise ValueError("RLearner must be fitted before predict_mu().")
+        X_df = X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
+        return self.model_y.predict(X_df)
+
+    def predict_outcome(self, X, treatment_value):
+        """Predicts E[Y|X, T=treatment_value]."""
+        mu = self.predict_mu(X)
+        tau = self.predict_cate(X)
+        return mu + (float(treatment_value) * tau)
 
 def true_physics_cate(row):
     """
@@ -12,6 +84,7 @@ def true_physics_cate(row):
     """
     multiplier = 0.5 - (0.10 * row['frequency']) + (0.04 * row['recency'])
     return max(0, multiplier)
+
 
 if __name__ == "__main__":
     print("1. Loading the biased Data Lake...")
@@ -24,40 +97,9 @@ if __name__ == "__main__":
     Y = df['converted']
     
     print("\n2. Executing Double Machine Learning (R-Learner)...")
-    
-    # =====================================================================
-    # STAGE 1: RESIDUALIZATION (Isolating the Noise)
-    # We use cross_val_predict to prevent the models from overfitting to themselves.
-    # =====================================================================
-    print("   -> Modeling baseline conversion (Y ~ X)...")
-    # We use a Regressor even though Y is binary, as we want the probability
-    model_y = XGBRegressor(max_depth=5, random_state=42)
-    Y_pred = cross_val_predict(model_y, X, Y, cv=5)
-    Y_res = Y - Y_pred  # What conversion behavior couldn't be explained by context?
-    
-    print("   -> Modeling treatment assignment bias (T ~ X)...")
-    # This models the legacy system's bad policy
-    model_t = XGBRegressor(max_depth=5, random_state=42)
-    T_pred = cross_val_predict(model_t, X, T, cv=5)
-    T_res = T - T_pred  # What was the true 'randomness' in the discount given?
-    
-    # =====================================================================
-    # STAGE 2: SIGNAL EXTRACTION (The Nie-Wager Formulation)
-    # We want to find CATE(X) such that Y_res = CATE(X) * T_res.
-    # We transform this into a weighted regression problem.
-    # =====================================================================
-    print("   -> Training final CATE estimator on residuals...")
-    # Add tiny epsilon to prevent division by zero
-    epsilon = 1e-6
-    cate_target = Y_res / (T_res + epsilon)
-    weights = T_res**2  # Weight by T_res^2 to penalize instances where T_res was tiny
-    
-    # Train the final model to predict the CATE based on user context
-    cate_model = XGBRegressor(max_depth=5, random_state=42)
-    cate_model.fit(X, cate_target, sample_weight=weights)
-    
-    # Predict the individual causal effect for every user in the dataset
-    df['predicted_cate'] = cate_model.predict(X)
+    print("   -> Fitting RLearner with XGBoost nuisance and CATE models...")
+    r_learner = RLearner(random_state=42, cv=5, epsilon=1e-6).fit(X, T, Y)
+    df['predicted_cate'] = r_learner.predict_cate(X)
     
     # =====================================================================
     # EVALUATION: DID IT BEAT THE ILLUSION?

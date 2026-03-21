@@ -54,6 +54,11 @@ try:
 except ImportError:
     from .environment import UberMarketplaceEnvironment, UberMarketplaceEnvironmentWithShock # Package import mode
 
+try:
+    from r_learner import RLearner  # Script execution mode
+except ImportError:
+    from .r_learner import RLearner  # Package import mode
+
 class LinUCBAgent:
     """Original LinUCB agent with explicit covariance matrices."""
 
@@ -109,6 +114,27 @@ class LinUCBAgent:
             self.b[a] = self.A[a].dot(theta_prior)
             
             print(f"   Arm {a} Prior Injected successfully.")
+
+    def inject_linear_priors(self, prior_thetas, prior_weight=1.0):
+        """Injects per-arm linear priors directly into LinUCB state.
+
+        Args:
+            prior_thetas: Dict/list mapping arm index -> theta vector.
+            prior_weight: Pseudo-count confidence for initializing A matrices.
+        """
+        prior_weight = float(prior_weight)
+        if prior_weight <= 0:
+            raise ValueError("prior_weight must be positive")
+
+        for a in range(self.n_actions):
+            theta = np.asarray(prior_thetas[a], dtype=float)
+            if theta.shape != (self.n_features,):
+                raise ValueError(
+                    f"Prior theta for arm {a} must have shape ({self.n_features},), got {theta.shape}"
+                )
+
+            self.A[a] = np.identity(self.n_features) * prior_weight
+            self.b[a] = self.A[a].dot(theta)
         
     def _get_context_vector(self, state_dict):
         """
@@ -176,6 +202,11 @@ class FastLinUCBAgent(LinUCBAgent):
         super().inject_offline_prior(historical_df, model_y, cate_model, discount_levels)
         self.A_inv = [np.linalg.inv(a_matrix) for a_matrix in self.A]
 
+    def inject_linear_priors(self, prior_thetas, prior_weight=1.0):
+        """Injects direct linear priors and refreshes inverse matrices."""
+        super().inject_linear_priors(prior_thetas, prior_weight=prior_weight)
+        self.A_inv = [np.linalg.inv(a_matrix) for a_matrix in self.A]
+
     def choose_action(self, state_dict):
         x = self._get_context_vector(state_dict)
         ucb_scores = np.zeros(self.n_actions)
@@ -233,7 +264,103 @@ class FastLinUCBAgent(LinUCBAgent):
         return self.A_inv[action].dot(self.b[action])
 
 
-def run_agent_simulation(agent_class, env_seed=100, n_steps=15000, progress_every=5000, env_class=None, env_kwargs=None, **agent_kwargs):
+def _build_bandit_feature_matrix(dataframe):
+    """Builds the normalized feature matrix expected by LinUCB."""
+    return np.array([
+        np.ones(len(dataframe)),
+        dataframe["recency"].to_numpy(dtype=float) / 30.0,
+        dataframe["frequency"].to_numpy(dtype=float) / 20.0,
+        dataframe["weather_active"].to_numpy(dtype=float),
+        dataframe["surge_multiplier"].to_numpy(dtype=float) / 3.0,
+    ]).T
+
+
+def extract_rlearner_linear_priors_from_csv(
+    offline_csv_path,
+    ridge_alpha=1.0,
+    epsilon=1e-6,
+    rlearner_cv=5,
+    rlearner_random_state=42,
+    discount_levels=None,
+):
+    """Extracts linear per-arm priors from offline logs using R-learner-style residualization.
+
+    This function uses the normal static environment logs and returns linear priors
+    aligned with LinUCB's normalized feature space.
+    """
+    if discount_levels is None:
+        discount_levels = [0.0, 0.1, 0.2]
+
+    required_columns = {
+        "recency",
+        "frequency",
+        "weather_active",
+        "surge_multiplier",
+        "discount_value",
+        "converted",
+    }
+
+    historical_df = pd.read_csv(offline_csv_path)
+    missing = required_columns.difference(historical_df.columns)
+    if missing:
+        raise ValueError(f"Offline dataset is missing required columns: {sorted(missing)}")
+
+    X_raw = historical_df[["recency", "frequency", "weather_active", "surge_multiplier"]]
+    X_bandit = _build_bandit_feature_matrix(historical_df)
+    Y = historical_df["converted"].to_numpy(dtype=float)
+    T = historical_df["discount_value"].to_numpy(dtype=float)
+
+    # Stage 1+2: Learn CATE with reusable RLearner (XGBoost).
+    rlearner = RLearner(
+        random_state=rlearner_random_state,
+        cv=rlearner_cv,
+        epsilon=epsilon,
+    ).fit(X_raw, T, Y)
+
+    # Distill nonlinear CATE into linear LinUCB feature space.
+    cate_target = rlearner.predict_cate(X_raw)
+    cate_weights = np.ones_like(cate_target)
+    cate_linear = Ridge(alpha=ridge_alpha, fit_intercept=False)
+    cate_linear.fit(X_bandit, cate_target, sample_weight=cate_weights)
+    theta_tau = cate_linear.coef_
+
+    # Baseline arm prior from control samples only.
+    control_mask = np.isclose(T, 0.0)
+    if not np.any(control_mask):
+        raise ValueError("Offline dataset has no control samples with discount_value=0.0")
+
+    baseline_linear = Ridge(alpha=ridge_alpha, fit_intercept=False)
+    baseline_linear.fit(X_bandit[control_mask], Y[control_mask])
+    theta_0 = baseline_linear.coef_
+
+    priors = {
+        arm_idx: theta_0 + (discount * theta_tau)
+        for arm_idx, discount in enumerate(discount_levels)
+    }
+
+    return {
+        "priors": priors,
+        "theta_control": theta_0,
+        "theta_tau": theta_tau,
+        "ridge_alpha": ridge_alpha,
+        "rlearner_cv": rlearner_cv,
+        "rlearner_random_state": rlearner_random_state,
+        "n_samples": int(len(historical_df)),
+        "X_columns": ["recency", "frequency", "weather_active", "surge_multiplier"],
+    }
+
+
+def run_agent_simulation(
+    agent_class,
+    env_seed=100,
+    n_steps=15000,
+    progress_every=5000,
+    env_class=None,
+    env_kwargs=None,
+    prior_thetas=None,
+    prior_weight=1.0,
+    **agent_kwargs,
+):
     """Runs one full simulation and returns metrics for the given agent class.
     
     Args:
@@ -243,6 +370,8 @@ def run_agent_simulation(agent_class, env_seed=100, n_steps=15000, progress_ever
         progress_every: Print progress every N steps
         env_class: Optional custom environment class (defaults to UberMarketplaceEnvironment)
         env_kwargs: Optional dict of kwargs to pass to environment constructor
+        prior_thetas: Optional per-arm theta vectors for warm-start injection
+        prior_weight: Confidence weight for warm-start priors
         **agent_kwargs: Additional kwargs passed to agent_class constructor
     """
     if env_class is None:
@@ -251,6 +380,10 @@ def run_agent_simulation(agent_class, env_seed=100, n_steps=15000, progress_ever
         env_kwargs = {}
     env = env_class(seed=env_seed, **env_kwargs)
     agent = agent_class(n_actions=3, n_features=5, **agent_kwargs)
+
+    if prior_thetas is not None:
+        agent.inject_linear_priors(prior_thetas, prior_weight=prior_weight)
+        print(f"   -> Injected offline priors with prior_weight={prior_weight:.1f}")
 
     reward_history = []
     true_conversion_history = []
@@ -534,6 +667,8 @@ def run_multi_seed_comparison(
     env_kwargs=None,
     original_kwargs=None,
     fast_kwargs=None,
+    prior_thetas=None,
+    prior_weight=1.0,
 ):
     """Runs both algorithms across multiple seeds and returns aggregated results.
 
@@ -545,6 +680,8 @@ def run_multi_seed_comparison(
         env_kwargs: Optional kwargs passed to environment constructor.
         original_kwargs: Optional kwargs for LinUCBAgent.
         fast_kwargs: Optional kwargs for FastLinUCBAgent.
+        prior_thetas: Optional shared per-arm priors injected into both agents.
+        prior_weight: Confidence weight used for prior injection.
     """
     if seeds is None:
         seeds = [100, 101, 102, 103, 104]
@@ -571,6 +708,8 @@ def run_multi_seed_comparison(
             progress_every=progress_every,
             env_class=env_class,
             env_kwargs=env_kwargs,
+            prior_thetas=prior_thetas,
+            prior_weight=prior_weight,
             **original_kwargs,
         )
         fast_result = run_agent_simulation(
@@ -580,6 +719,8 @@ def run_multi_seed_comparison(
             progress_every=progress_every,
             env_class=env_class,
             env_kwargs=env_kwargs,
+            prior_thetas=prior_thetas,
+            prior_weight=prior_weight,
             **fast_kwargs,
         )
         original_runs.append(original_result)
@@ -900,6 +1041,175 @@ def plot_multi_seed_shock_comparison(multi_seed_result, shock_step, rolling_wind
 
     plt.tight_layout()
     plt.show()
+
+
+def plot_cold_vs_warm_start_comparison(cold_start_result, warm_start_result):
+    """Compares cold-start vs warm-start for each algorithm separately.
+
+    The first row shows Original LinUCB (cold vs warm).
+    The second row shows Fast LinUCB (cold vs warm).
+    """
+
+    def cumulative_average(data):
+        arr = np.asarray(data, dtype=float)
+        if arr.size == 0:
+            return arr
+        return np.cumsum(arr) / np.arange(1, arr.size + 1)
+
+    def mean_std_band(series_list):
+        matrix = np.vstack(series_list)
+        return np.mean(matrix, axis=0), np.std(matrix, axis=0)
+
+    def _extract_algorithm_curves(multi_seed_result, algo_key):
+        if algo_key == "original":
+            runs = multi_seed_result["original_runs"]
+        else:
+            runs = multi_seed_result["fast_runs"]
+
+        conv_mean, conv_std = mean_std_band(
+            [cumulative_average(run["reward_history"]) for run in runs]
+        )
+        regret_mean, regret_std = mean_std_band([run["regret_history"] for run in runs])
+        mse_mean, mse_std = mean_std_band([run["mse_history"] for run in runs])
+
+        return {
+            "conv": (conv_mean, conv_std),
+            "regret": (regret_mean, regret_std),
+            "mse": (mse_mean, mse_std),
+        }
+
+    cold_original = _extract_algorithm_curves(cold_start_result, "original")
+    warm_original = _extract_algorithm_curves(warm_start_result, "original")
+    cold_fast = _extract_algorithm_curves(cold_start_result, "fast")
+    warm_fast = _extract_algorithm_curves(warm_start_result, "fast")
+
+    plt.figure(figsize=(18, 10))
+
+    def _draw_metric_subplot(position, metric_key, ylabel, title, cold_data, warm_data):
+        cold_mean, cold_std = cold_data[metric_key]
+        warm_mean, warm_std = warm_data[metric_key]
+
+        x_cold = np.arange(len(cold_mean))
+        x_warm = np.arange(len(warm_mean))
+
+        plt.subplot(2, 3, position)
+        plt.plot(x_cold, cold_mean, color="tab:blue", label="Cold-start Mean")
+        plt.fill_between(
+            x_cold,
+            cold_mean - cold_std,
+            cold_mean + cold_std,
+            color="tab:blue",
+            alpha=0.2,
+            label="Cold-start ±1 std",
+        )
+        plt.plot(x_warm, warm_mean, color="tab:green", label="Warm-start Mean")
+        plt.fill_between(
+            x_warm,
+            warm_mean - warm_std,
+            warm_mean + warm_std,
+            color="tab:green",
+            alpha=0.2,
+            label="Warm-start ±1 std",
+        )
+        plt.xlabel("Steps")
+        plt.ylabel(ylabel)
+        plt.title(title)
+        plt.legend()
+
+    # Row 1: Original LinUCB cold vs warm
+    _draw_metric_subplot(
+        position=1,
+        metric_key="conv",
+        ylabel="Cumulative Average Conversion",
+        title="Original LinUCB: Conversion (Cold vs Warm)",
+        cold_data=cold_original,
+        warm_data=warm_original,
+    )
+    _draw_metric_subplot(
+        position=2,
+        metric_key="regret",
+        ylabel="Cumulative Regret",
+        title="Original LinUCB: Regret (Cold vs Warm)",
+        cold_data=cold_original,
+        warm_data=warm_original,
+    )
+    _draw_metric_subplot(
+        position=3,
+        metric_key="mse",
+        ylabel="MSE",
+        title="Original LinUCB: MSE (Cold vs Warm)",
+        cold_data=cold_original,
+        warm_data=warm_original,
+    )
+
+    # Row 2: Fast LinUCB cold vs warm
+    _draw_metric_subplot(
+        position=4,
+        metric_key="conv",
+        ylabel="Cumulative Average Conversion",
+        title="Fast LinUCB: Conversion (Cold vs Warm)",
+        cold_data=cold_fast,
+        warm_data=warm_fast,
+    )
+    _draw_metric_subplot(
+        position=5,
+        metric_key="regret",
+        ylabel="Cumulative Regret",
+        title="Fast LinUCB: Regret (Cold vs Warm)",
+        cold_data=cold_fast,
+        warm_data=warm_fast,
+    )
+    _draw_metric_subplot(
+        position=6,
+        metric_key="mse",
+        ylabel="MSE",
+        title="Fast LinUCB: MSE (Cold vs Warm)",
+        cold_data=cold_fast,
+        warm_data=warm_fast,
+    )
+
+    plt.tight_layout()
+    plt.show()
+
+
+def run_static_warm_start_multi_seed(
+    offline_csv_path,
+    seeds=None,
+    n_steps=35000,
+    progress_every=5000,
+    prior_weight=1.0,
+    ridge_alpha=1.0,
+    rlearner_cv=5,
+    rlearner_random_state=42,
+    original_kwargs=None,
+    fast_kwargs=None,
+):
+    """Runs multi-seed static-environment comparison with R-learner priors from offline data."""
+    prior_bundle = extract_rlearner_linear_priors_from_csv(
+        offline_csv_path=offline_csv_path,
+        ridge_alpha=ridge_alpha,
+        rlearner_cv=rlearner_cv,
+        rlearner_random_state=rlearner_random_state,
+    )
+    priors = prior_bundle["priors"]
+
+    print("\n--- Offline Prior Extraction Complete ---")
+    print(f"   Offline samples: {prior_bundle['n_samples']}")
+    print(f"   prior_weight: {prior_weight}")
+
+    results = run_multi_seed_comparison(
+        seeds=seeds,
+        n_steps=n_steps,
+        progress_every=progress_every,
+        env_class=UberMarketplaceEnvironment,
+        env_kwargs={},
+        original_kwargs=original_kwargs,
+        fast_kwargs=fast_kwargs,
+        prior_thetas=priors,
+        prior_weight=prior_weight,
+    )
+    results["prior_bundle"] = prior_bundle
+    return results
 
 # =====================================================================
 # THE ONLINE SIMULATION RUNNER
