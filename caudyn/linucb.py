@@ -44,14 +44,15 @@ Execution Loop:
 
 
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import time
 from sklearn.linear_model import Ridge
 
 try:
-    from environment import UberMarketplaceEnvironment # Script execution mode
+    from environment import UberMarketplaceEnvironment, UberMarketplaceEnvironmentWithShock # Script execution mode
 except ImportError:
-    from .environment import UberMarketplaceEnvironment # Package import mode
+    from .environment import UberMarketplaceEnvironment, UberMarketplaceEnvironmentWithShock # Package import mode
 
 class LinUCBAgent:
     """Original LinUCB agent with explicit covariance matrices."""
@@ -232,16 +233,27 @@ class FastLinUCBAgent(LinUCBAgent):
         return self.A_inv[action].dot(self.b[action])
 
 
-def run_agent_simulation(agent_class, env_seed=100, n_steps=15000, progress_every=5000, **agent_kwargs):
-    """Runs one full simulation and returns metrics for the given agent class."""
-    env = UberMarketplaceEnvironment(seed=env_seed)
+def run_agent_simulation(agent_class, env_seed=100, n_steps=15000, progress_every=5000, env_class=None, env_kwargs=None, **agent_kwargs):
+    """Runs one full simulation and returns metrics for the given agent class.
+    
+    Args:
+        agent_class: The bandit agent class to instantiate
+        env_seed: RNG seed for environment reproducibility
+        n_steps: Number of simulation steps
+        progress_every: Print progress every N steps
+        env_class: Optional custom environment class (defaults to UberMarketplaceEnvironment)
+        env_kwargs: Optional dict of kwargs to pass to environment constructor
+        **agent_kwargs: Additional kwargs passed to agent_class constructor
+    """
+    if env_class is None:
+        env_class = UberMarketplaceEnvironment
+    if env_kwargs is None:
+        env_kwargs = {}
+    env = env_class(seed=env_seed, **env_kwargs)
     agent = agent_class(n_actions=3, n_features=5, **agent_kwargs)
 
-    cumulative_rewards = 0.0
     reward_history = []
-    cumulative_true_conversion = 0.0
     true_conversion_history = []
-    cumulative_oracle_conversion = 0.0
     oracle_conversion_history = []
     cumulative_regret = 0.0
     regret_history = []
@@ -259,10 +271,9 @@ def run_agent_simulation(agent_class, env_seed=100, n_steps=15000, progress_ever
         optimal_prob = np.max(true_probs)
         chosen_prob = true_probs[action]
 
-        cumulative_true_conversion += chosen_prob
-        true_conversion_history.append(cumulative_true_conversion / (step + 1))
-        cumulative_oracle_conversion += optimal_prob
-        oracle_conversion_history.append(cumulative_oracle_conversion / (step + 1))
+        # Store raw per-step probabilities (no cumulative averaging).
+        true_conversion_history.append(chosen_prob)
+        oracle_conversion_history.append(optimal_prob)
 
         step_regret = optimal_prob - chosen_prob
         cumulative_regret += step_regret
@@ -276,17 +287,42 @@ def run_agent_simulation(agent_class, env_seed=100, n_steps=15000, progress_ever
         next_state, reward, _ = env.step(action)
         agent.update(action, state, reward)
 
-        cumulative_rewards += reward
-        reward_history.append(cumulative_rewards / (step + 1))
+        # Store raw binary reward for this step (0 or 1).
+        reward_history.append(reward)
         state = next_state
 
         if (step + 1) % progress_every == 0:
             current_rmse = np.sqrt(np.mean(mse_history[-progress_every:]))
-            print(f"   -> Step {step + 1}: Average Conversion Rate = {reward_history[-1]:.1%}")
+            recent_avg_conversion = np.mean(reward_history[-progress_every:])
+            print(f"   -> Step {step + 1}: Recent Avg Conversion Rate = {recent_avg_conversion:.1%}")
             print(f"      Cumulative Regret: {cumulative_regret:.2f}")
             print(f"      Recent Prediction RMSE: {current_rmse:.4f}")
 
     runtime_seconds = time.perf_counter() - start_time
+
+    period_summaries = None
+    if hasattr(env, "shock_step"):
+        split_idx = int(min(max(env.shock_step, 0), len(reward_history)))
+
+        def _build_period_summary(start_idx, end_idx, label):
+            if end_idx <= start_idx:
+                return None
+            return {
+                "label": label,
+                "start_step": start_idx + 1,
+                "end_step": end_idx,
+                "avg_conversion": float(np.mean(reward_history[start_idx:end_idx])),
+                "avg_true_conversion": float(np.mean(true_conversion_history[start_idx:end_idx])),
+                "avg_oracle_conversion": float(np.mean(oracle_conversion_history[start_idx:end_idx])),
+            }
+
+        period_summaries = []
+        pre_summary = _build_period_summary(0, split_idx, "Pre-shock")
+        post_summary = _build_period_summary(split_idx, len(reward_history), "Post-shock")
+        if pre_summary is not None:
+            period_summaries.append(pre_summary)
+        if post_summary is not None:
+            period_summaries.append(post_summary)
 
     return {
         "agent_name": agent_class.__name__,
@@ -297,12 +333,13 @@ def run_agent_simulation(agent_class, env_seed=100, n_steps=15000, progress_ever
         "oracle_conversion_history": oracle_conversion_history,
         "regret_history": regret_history,
         "mse_history": mse_history,
-        "avg_conversion": reward_history[-1],
-        "avg_true_conversion": true_conversion_history[-1],
-        "avg_oracle_conversion": oracle_conversion_history[-1],
+        "avg_conversion": float(np.mean(reward_history)),
+        "avg_true_conversion": float(np.mean(true_conversion_history)),
+        "avg_oracle_conversion": float(np.mean(oracle_conversion_history)),
         "cumulative_regret": cumulative_regret,
         "final_rmse": float(np.sqrt(np.mean(mse_history[-progress_every:]))),
         "runtime_seconds": runtime_seconds,
+        "period_summaries": period_summaries,
     }
 
 
@@ -330,6 +367,21 @@ def print_comparison(original_result, fast_result):
     print(f"   Final RMSE                    {original_result['final_rmse']:.4f}          {fast_result['final_rmse']:.4f}")
     print(f"   Runtime (seconds)             {original_result['runtime_seconds']:.2f}          {fast_result['runtime_seconds']:.2f}")
 
+    original_periods = original_result.get("period_summaries")
+    fast_periods = fast_result.get("period_summaries")
+    if original_periods and fast_periods and len(original_periods) == len(fast_periods):
+        print("\n   Period Summary (environment change detected):")
+        print("   Period               Original Conv    Fast Conv    Oracle (Orig)   Oracle (Fast)")
+        for original_period, fast_period in zip(original_periods, fast_periods):
+            label = f"{original_period['label']} [{original_period['start_step']}-{original_period['end_step']}]"
+            print(
+                f"   {label:<20} "
+                f"{original_period['avg_conversion']:.4f}         "
+                f"{fast_period['avg_conversion']:.4f}      "
+                f"{original_period['avg_oracle_conversion']:.4f}         "
+                f"{fast_period['avg_oracle_conversion']:.4f}"
+            )
+
 
 def plot_comparison(original_result, fast_result):
     """Plots side-by-side learning curves for Original and Fast LinUCB."""
@@ -337,21 +389,42 @@ def plot_comparison(original_result, fast_result):
     fast_color = "tab:orange"
     oracle_color = "black"
 
+    def cumulative_average(data):
+        """Returns cumulative average so the plotted metric matches its label."""
+        arr = np.asarray(data, dtype=float)
+        if arr.size == 0:
+            return arr
+        return np.cumsum(arr) / np.arange(1, arr.size + 1)
+
     plt.figure(figsize=(18, 5))
 
+    original_avg_conversion = cumulative_average(original_result["reward_history"])
+    fast_avg_conversion = cumulative_average(fast_result["reward_history"])
+    original_oracle_avg = cumulative_average(original_result["oracle_conversion_history"])
+    fast_oracle_avg = cumulative_average(fast_result["oracle_conversion_history"])
+
     plt.subplot(1, 3, 1)
-    plt.plot(original_result["reward_history"], label="Original LinUCB", color=original_color)
-    plt.plot(fast_result["reward_history"], label="Fast LinUCB", color=fast_color, alpha=0.9)
+    plt.plot(original_avg_conversion, label="Original LinUCB", color=original_color)
+    plt.plot(fast_avg_conversion, label="Fast LinUCB", color=fast_color, alpha=0.9)
     plt.plot(
-        original_result["oracle_conversion_history"],
-        label="Ground Truth (Oracle)",
+        original_oracle_avg,
+        label="Oracle (Original Trajectory)",
         color=oracle_color,
         linestyle="--",
         linewidth=1.5,
     )
+    if len(original_oracle_avg) == len(fast_oracle_avg) and not np.allclose(original_oracle_avg, fast_oracle_avg):
+        plt.plot(
+            fast_oracle_avg,
+            label="Oracle (Fast Trajectory)",
+            color="tab:gray",
+            linestyle="--",
+            linewidth=1.5,
+            alpha=0.9,
+        )
     plt.xlabel("Steps")
-    plt.ylabel("Average Conversion")
-    plt.title("Average Conversion vs Ground Truth")
+    plt.ylabel("Cumulative Average Conversion")
+    plt.title("Cumulative Average Conversion vs Oracle")
     plt.legend()
 
     plt.subplot(1, 3, 2)
@@ -373,10 +446,472 @@ def plot_comparison(original_result, fast_result):
     plt.tight_layout()
     plt.show()
 
+
+def split_rolling_average(data, shock_step, window=1000):
+    """Calculates a rolling average that respects structural breaks.
+    
+    Prevents pre-shock data from smearing into post-shock visualizations.
+    Calculates rolling average independently for Phase 1 and Phase 2, then stitches them together.
+    """
+    # Phase 1: Pre-shock
+    # Using min_periods=1 ensures the graph starts immediately at step 0
+    phase_1 = pd.Series(data[:shock_step]).rolling(window=window, min_periods=1).mean()
+    
+    # Phase 2: Post-shock
+    # The rolling window completely resets here. No Phase 1 data is allowed.
+    phase_2 = pd.Series(data[shock_step:]).rolling(window=window, min_periods=1).mean()
+    
+    # Stitch them back together into a single continuous array
+    return pd.concat([phase_1, phase_2]).values
+
+
+def plot_shock_comparison(original_result, fast_result, shock_step=17500):
+    """Plots comparison with shock environment, highlighting the market crash event.
+    
+    Includes a vertical line marking the exact moment of the economic shock.
+    This reveals how each algorithm adapts: Original becomes paralyzed, Fast recovers.
+    """
+    original_color = "tab:blue"
+    fast_color = "tab:orange"
+    oracle_color = "black"
+    shock_color = "violet"
+
+    plt.figure(figsize=(18, 5))
+
+    # Rolling average for conversion metrics to reveal non-stationary regime shifts.
+    rolling_window = 1000
+
+    original_reward_rolling = split_rolling_average(original_result["reward_history"], shock_step, window=rolling_window)
+    fast_reward_rolling = split_rolling_average(fast_result["reward_history"], shock_step, window=rolling_window)
+    oracle_rolling = split_rolling_average(original_result["oracle_conversion_history"], shock_step, window=rolling_window)
+
+    # Subplot 1: Conversion (1,000-step rolling window, split at shock boundary)
+    plt.subplot(1, 3, 1)
+    plt.axvline(x=shock_step, color=shock_color, linestyle=':', linewidth=2.5, label='Economic Shock', alpha=0.7)
+    plt.plot(original_reward_rolling, label="Original LinUCB (rolling=1000)", color=original_color)
+    plt.plot(fast_reward_rolling, label="Fast LinUCB (rolling=1000)", color=fast_color, alpha=0.9)
+    plt.plot(
+        oracle_rolling,
+        label="Ground Truth (Oracle, rolling=1000)",
+        color=oracle_color,
+        linestyle="--",
+        linewidth=1.5,
+    )
+    plt.xlabel("Steps")
+    plt.ylabel("Average Conversion")
+    plt.title("Conversion: Adaptability to Market Shock (Split Rolling Window)")
+    plt.legend()
+
+    # Subplot 2: Regret
+    plt.subplot(1, 3, 2)
+    plt.axvline(x=shock_step, color=shock_color, linestyle=':', linewidth=2.5, label='Economic Shock', alpha=0.7)
+    plt.plot(original_result["regret_history"], label="Original LinUCB", color=original_color)
+    plt.plot(fast_result["regret_history"], label="Fast LinUCB", color=fast_color, alpha=0.9)
+    plt.xlabel("Steps")
+    plt.ylabel("Cumulative Regret")
+    plt.title("Regret: Recovery Speed After Shock")
+    plt.legend()
+
+    # Subplot 3: MSE
+    plt.subplot(1, 3, 3)
+    plt.axvline(x=shock_step, color=shock_color, linestyle=':', linewidth=2.5, label='Economic Shock', alpha=0.7)
+    plt.plot(original_result["mse_history"], label="Original LinUCB", color=original_color, alpha=0.5)
+    plt.plot(fast_result["mse_history"], label="Fast LinUCB", color=fast_color, alpha=0.5)
+    plt.xlabel("Steps")
+    plt.ylabel("MSE")
+    plt.title("Prediction MSE: Model Resilience")
+    plt.legend()
+
+    plt.tight_layout()
+    plt.show()
+
+
+def run_multi_seed_comparison(
+    seeds=None,
+    n_steps=15000,
+    progress_every=5000,
+    env_class=None,
+    env_kwargs=None,
+    original_kwargs=None,
+    fast_kwargs=None,
+):
+    """Runs both algorithms across multiple seeds and returns aggregated results.
+
+    Args:
+        seeds: Iterable of integer seeds. Defaults to 5 seeds.
+        n_steps: Number of simulation steps for each run.
+        progress_every: Progress logging interval.
+        env_class: Optional environment class.
+        env_kwargs: Optional kwargs passed to environment constructor.
+        original_kwargs: Optional kwargs for LinUCBAgent.
+        fast_kwargs: Optional kwargs for FastLinUCBAgent.
+    """
+    if seeds is None:
+        seeds = [100, 101, 102, 103, 104]
+    if env_kwargs is None:
+        env_kwargs = {}
+    if original_kwargs is None:
+        original_kwargs = {"alpha": 0.5}
+    if fast_kwargs is None:
+        fast_kwargs = {"alpha": 0.5, "gamma": 0.995}
+
+    original_runs = []
+    fast_runs = []
+
+    print("\n" + "=" * 70)
+    print(f"MULTI-SEED BENCHMARK: {len(seeds)} seeds")
+    print("=" * 70)
+
+    for run_idx, seed in enumerate(seeds, start=1):
+        print(f"\n[Seed {run_idx}/{len(seeds)}] env_seed={seed}")
+        original_result = run_agent_simulation(
+            LinUCBAgent,
+            env_seed=seed,
+            n_steps=n_steps,
+            progress_every=progress_every,
+            env_class=env_class,
+            env_kwargs=env_kwargs,
+            **original_kwargs,
+        )
+        fast_result = run_agent_simulation(
+            FastLinUCBAgent,
+            env_seed=seed,
+            n_steps=n_steps,
+            progress_every=progress_every,
+            env_class=env_class,
+            env_kwargs=env_kwargs,
+            **fast_kwargs,
+        )
+        original_runs.append(original_result)
+        fast_runs.append(fast_result)
+
+    def _aggregate_scalar_metric(runs, metric_name):
+        values = np.array([run[metric_name] for run in runs], dtype=float)
+        return {
+            "mean": float(np.mean(values)),
+            "std": float(np.std(values)),
+            "values": values,
+        }
+
+    summary = {
+        "avg_conversion": {
+            "original": _aggregate_scalar_metric(original_runs, "avg_conversion"),
+            "fast": _aggregate_scalar_metric(fast_runs, "avg_conversion"),
+        },
+        "cumulative_regret": {
+            "original": _aggregate_scalar_metric(original_runs, "cumulative_regret"),
+            "fast": _aggregate_scalar_metric(fast_runs, "cumulative_regret"),
+        },
+        "final_rmse": {
+            "original": _aggregate_scalar_metric(original_runs, "final_rmse"),
+            "fast": _aggregate_scalar_metric(fast_runs, "final_rmse"),
+        },
+        "runtime_seconds": {
+            "original": _aggregate_scalar_metric(original_runs, "runtime_seconds"),
+            "fast": _aggregate_scalar_metric(fast_runs, "runtime_seconds"),
+        },
+    }
+
+    return {
+        "seeds": list(seeds),
+        "original_runs": original_runs,
+        "fast_runs": fast_runs,
+        "summary": summary,
+    }
+
+
+def print_multi_seed_summary(multi_seed_result):
+    """Prints scalar mean/std summary for multi-seed runs."""
+    summary = multi_seed_result["summary"]
+
+    def _row(metric_key, label):
+        orig = summary[metric_key]["original"]
+        fast = summary[metric_key]["fast"]
+        print(
+            f"   {label:<24} "
+            f"{orig['mean']:.4f} ± {orig['std']:.4f}    "
+            f"{fast['mean']:.4f} ± {fast['std']:.4f}"
+        )
+
+    print("\nMulti-Seed Summary (mean ± std)")
+    print(f"   Seeds: {multi_seed_result['seeds']}")
+    print("   Metric                    Original                 Fast")
+    _row("avg_conversion", "Avg Conversion")
+    _row("cumulative_regret", "Cumulative Regret")
+    _row("final_rmse", "Final RMSE")
+    _row("runtime_seconds", "Runtime (seconds)")
+
+
+def plot_multi_seed_comparison(multi_seed_result):
+    """Plots mean ± std trajectories across seeds for both algorithms."""
+    original_color = "tab:blue"
+    fast_color = "tab:orange"
+
+    original_runs = multi_seed_result["original_runs"]
+    fast_runs = multi_seed_result["fast_runs"]
+
+    def cumulative_average(data):
+        arr = np.asarray(data, dtype=float)
+        if arr.size == 0:
+            return arr
+        return np.cumsum(arr) / np.arange(1, arr.size + 1)
+
+    def mean_std_band(series_list):
+        matrix = np.vstack(series_list)
+        return np.mean(matrix, axis=0), np.std(matrix, axis=0)
+
+    original_conv_mean, original_conv_std = mean_std_band(
+        [cumulative_average(run["reward_history"]) for run in original_runs]
+    )
+    fast_conv_mean, fast_conv_std = mean_std_band(
+        [cumulative_average(run["reward_history"]) for run in fast_runs]
+    )
+
+    original_regret_mean, original_regret_std = mean_std_band(
+        [run["regret_history"] for run in original_runs]
+    )
+    fast_regret_mean, fast_regret_std = mean_std_band(
+        [run["regret_history"] for run in fast_runs]
+    )
+
+    original_mse_mean, original_mse_std = mean_std_band(
+        [run["mse_history"] for run in original_runs]
+    )
+    fast_mse_mean, fast_mse_std = mean_std_band(
+        [run["mse_history"] for run in fast_runs]
+    )
+
+    x_conv = np.arange(len(original_conv_mean))
+    x_regret = np.arange(len(original_regret_mean))
+    x_mse = np.arange(len(original_mse_mean))
+
+    plt.figure(figsize=(18, 5))
+
+    # Subplot 1: Cumulative average conversion
+    plt.subplot(1, 3, 1)
+    plt.plot(x_conv, original_conv_mean, label="Original LinUCB Mean", color=original_color)
+    plt.fill_between(
+        x_conv,
+        original_conv_mean - original_conv_std,
+        original_conv_mean + original_conv_std,
+        color=original_color,
+        alpha=0.2,
+        label="Original ±1 std",
+    )
+    plt.plot(x_conv, fast_conv_mean, label="Fast LinUCB Mean", color=fast_color)
+    plt.fill_between(
+        x_conv,
+        fast_conv_mean - fast_conv_std,
+        fast_conv_mean + fast_conv_std,
+        color=fast_color,
+        alpha=0.2,
+        label="Fast ±1 std",
+    )
+    plt.xlabel("Steps")
+    plt.ylabel("Cumulative Average Conversion")
+    plt.title("Conversion Across Seeds")
+    plt.legend()
+
+    # Subplot 2: Cumulative regret
+    plt.subplot(1, 3, 2)
+    plt.plot(x_regret, original_regret_mean, label="Original LinUCB Mean", color=original_color)
+    plt.fill_between(
+        x_regret,
+        original_regret_mean - original_regret_std,
+        original_regret_mean + original_regret_std,
+        color=original_color,
+        alpha=0.2,
+    )
+    plt.plot(x_regret, fast_regret_mean, label="Fast LinUCB Mean", color=fast_color)
+    plt.fill_between(
+        x_regret,
+        fast_regret_mean - fast_regret_std,
+        fast_regret_mean + fast_regret_std,
+        color=fast_color,
+        alpha=0.2,
+    )
+    plt.xlabel("Steps")
+    plt.ylabel("Cumulative Regret")
+    plt.title("Regret Across Seeds")
+    plt.legend()
+
+    # Subplot 3: Prediction MSE
+    plt.subplot(1, 3, 3)
+    plt.plot(x_mse, original_mse_mean, label="Original LinUCB Mean", color=original_color)
+    plt.fill_between(
+        x_mse,
+        original_mse_mean - original_mse_std,
+        original_mse_mean + original_mse_std,
+        color=original_color,
+        alpha=0.2,
+    )
+    plt.plot(x_mse, fast_mse_mean, label="Fast LinUCB Mean", color=fast_color)
+    plt.fill_between(
+        x_mse,
+        fast_mse_mean - fast_mse_std,
+        fast_mse_mean + fast_mse_std,
+        color=fast_color,
+        alpha=0.2,
+    )
+    plt.xlabel("Steps")
+    plt.ylabel("MSE")
+    plt.title("Prediction MSE Across Seeds")
+    plt.legend()
+
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_multi_seed_shock_comparison(multi_seed_result, shock_step, rolling_window=1000):
+    """Plots shock scenario mean ± std across seeds for both algorithms.
+
+    Uses split rolling averages for conversion so pre-shock data does not smear
+    into post-shock estimates.
+    """
+    original_color = "tab:blue"
+    fast_color = "tab:orange"
+    shock_color = "violet"
+
+    original_runs = multi_seed_result["original_runs"]
+    fast_runs = multi_seed_result["fast_runs"]
+
+    def mean_std_band(series_list):
+        matrix = np.vstack(series_list)
+        return np.mean(matrix, axis=0), np.std(matrix, axis=0)
+
+    original_conv_mean, original_conv_std = mean_std_band(
+        [split_rolling_average(run["reward_history"], shock_step, rolling_window) for run in original_runs]
+    )
+    fast_conv_mean, fast_conv_std = mean_std_band(
+        [split_rolling_average(run["reward_history"], shock_step, rolling_window) for run in fast_runs]
+    )
+    oracle_conv_mean, oracle_conv_std = mean_std_band(
+        [split_rolling_average(run["oracle_conversion_history"], shock_step, rolling_window) for run in original_runs]
+    )
+
+    original_regret_mean, original_regret_std = mean_std_band(
+        [run["regret_history"] for run in original_runs]
+    )
+    fast_regret_mean, fast_regret_std = mean_std_band(
+        [run["regret_history"] for run in fast_runs]
+    )
+
+    original_mse_mean, original_mse_std = mean_std_band(
+        [run["mse_history"] for run in original_runs]
+    )
+    fast_mse_mean, fast_mse_std = mean_std_band(
+        [run["mse_history"] for run in fast_runs]
+    )
+
+    x_conv = np.arange(len(original_conv_mean))
+    x_regret = np.arange(len(original_regret_mean))
+    x_mse = np.arange(len(original_mse_mean))
+
+    plt.figure(figsize=(18, 5))
+
+    # Subplot 1: Conversion with split rolling window
+    plt.subplot(1, 3, 1)
+    plt.axvline(x=shock_step, color=shock_color, linestyle=":", linewidth=2.5, label="Economic Shock", alpha=0.7)
+    plt.plot(x_conv, original_conv_mean, label=f"Original Mean (rolling={rolling_window})", color=original_color)
+    plt.fill_between(
+        x_conv,
+        original_conv_mean - original_conv_std,
+        original_conv_mean + original_conv_std,
+        color=original_color,
+        alpha=0.2,
+        label="Original ±1 std",
+    )
+    plt.plot(x_conv, fast_conv_mean, label=f"Fast Mean (rolling={rolling_window})", color=fast_color)
+    plt.fill_between(
+        x_conv,
+        fast_conv_mean - fast_conv_std,
+        fast_conv_mean + fast_conv_std,
+        color=fast_color,
+        alpha=0.2,
+        label="Fast ±1 std",
+    )
+    plt.plot(
+        x_conv,
+        oracle_conv_mean,
+        label=f"Oracle Mean (rolling={rolling_window})",
+        color="black",
+        linestyle="--",
+        linewidth=1.5,
+    )
+    plt.fill_between(
+        x_conv,
+        oracle_conv_mean - oracle_conv_std,
+        oracle_conv_mean + oracle_conv_std,
+        color="black",
+        alpha=0.1,
+    )
+    plt.xlabel("Steps")
+    plt.ylabel("Average Conversion")
+    plt.title("Shock Conversion Across Seeds")
+    plt.legend()
+
+    # Subplot 2: Regret
+    plt.subplot(1, 3, 2)
+    plt.axvline(x=shock_step, color=shock_color, linestyle=":", linewidth=2.5, label="Economic Shock", alpha=0.7)
+    plt.plot(x_regret, original_regret_mean, label="Original Mean", color=original_color)
+    plt.fill_between(
+        x_regret,
+        original_regret_mean - original_regret_std,
+        original_regret_mean + original_regret_std,
+        color=original_color,
+        alpha=0.2,
+    )
+    plt.plot(x_regret, fast_regret_mean, label="Fast Mean", color=fast_color)
+    plt.fill_between(
+        x_regret,
+        fast_regret_mean - fast_regret_std,
+        fast_regret_mean + fast_regret_std,
+        color=fast_color,
+        alpha=0.2,
+    )
+    plt.xlabel("Steps")
+    plt.ylabel("Cumulative Regret")
+    plt.title("Shock Regret Across Seeds")
+    plt.legend()
+
+    # Subplot 3: MSE
+    plt.subplot(1, 3, 3)
+    plt.axvline(x=shock_step, color=shock_color, linestyle=":", linewidth=2.5, label="Economic Shock", alpha=0.7)
+    plt.plot(x_mse, original_mse_mean, label="Original Mean", color=original_color)
+    plt.fill_between(
+        x_mse,
+        original_mse_mean - original_mse_std,
+        original_mse_mean + original_mse_std,
+        color=original_color,
+        alpha=0.2,
+    )
+    plt.plot(x_mse, fast_mse_mean, label="Fast Mean", color=fast_color)
+    plt.fill_between(
+        x_mse,
+        fast_mse_mean - fast_mse_std,
+        fast_mse_mean + fast_mse_std,
+        color=fast_color,
+        alpha=0.2,
+    )
+    plt.xlabel("Steps")
+    plt.ylabel("MSE")
+    plt.title("Shock Prediction MSE Across Seeds")
+    plt.legend()
+
+    plt.tight_layout()
+    plt.show()
+
 # =====================================================================
 # THE ONLINE SIMULATION RUNNER
 # =====================================================================
 if __name__ == "__main__":
+    # =====================================================================
+    # BASELINE SIMULATION: Static Environment
+    # =====================================================================
+    print("\n" + "="*70)
+    print("BASELINE SIMULATION: Static Environment")
+    print("="*70)
+    
     n_steps = 15000
     original_result = run_agent_simulation(
         LinUCBAgent,
@@ -405,3 +940,50 @@ if __name__ == "__main__":
     print("is often weak or negative compared with low-frequency users.")
 
     plot_comparison(original_result, fast_result)
+
+    # =====================================================================
+    # SHOCK SIMULATION: Non-Stationary Environment Test
+    # =====================================================================
+    print("\n" + "="*70)
+    print("SHOCK SIMULATION: Testing Algorithm Adaptability to Market Crisis")
+    print("="*70)
+    
+    n_steps_shock = 35000
+    shock_step = 17500
+    
+    shock_result_original = run_agent_simulation(
+        LinUCBAgent,
+        env_seed=100,
+        n_steps=n_steps_shock,
+        progress_every=5000,
+        env_class=UberMarketplaceEnvironmentWithShock,
+        env_kwargs={'shock_step': shock_step},
+        alpha=0.5,
+    )
+
+    shock_result_fast = run_agent_simulation(
+        FastLinUCBAgent,
+        env_seed=100,
+        n_steps=n_steps_shock,
+        progress_every=5000,
+        env_class=UberMarketplaceEnvironmentWithShock,
+        env_kwargs={'shock_step': shock_step},
+        alpha=0.5,
+        gamma=0.995,
+    )
+
+    print("\n5. Shock Scenario Analysis:")
+    print(f"   Economic crash occurs at Step {shock_step} (exactly halfway through)")
+    print("   \n   Original LinUCB (Blue):")
+    print("   - Has 17,500 steps of 'good economy' data memorized in A_a")
+    print("   - When shock hits, confidence bounds are near zero")
+    print("   - Algorithm PARALYZED: continues offering old weak discounts")
+    print("   - Conversion rate CRASHES, Regret spikes sharply\n")
+    print("   Fast LinUCB (Orange):")
+    print("   - Discount factor (γ=0.995) keeps recent memory limited")
+    print("   - Old 'good economy' data exponentially fades away")
+    print("   - When shock hits, algorithm IMMEDIATELY begins exploring")
+    print("   - Rapidly discovers new optimal pricing, conversion recovers smoothly")
+    
+    print_comparison(shock_result_original, shock_result_fast)
+    plot_shock_comparison(shock_result_original, shock_result_fast, shock_step=shock_step)
