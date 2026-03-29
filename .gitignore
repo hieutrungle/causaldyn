@@ -29,3 +29,6 @@ diff_rt_calibration_prev/
 temp/
 temp_*
 tmp_*
+
+# OpenClaw
+.openclaw/

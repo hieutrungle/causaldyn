@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "causal-ml-marketplace"
+version = "0.1.0"
+description = "Marketplace contextual bandit and causal learning experiments"
+requires-python = ">=3.10"
+readme = "README.md"
+dynamic = ["dependencies"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Intended Audience :: Science/Research",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=9.0.2",
+  "black>=26.0",
+]
+
+[project.scripts]
+caudyn-run-causal-experiment = "caudyn.run_causal_experiment:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["caudyn*"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
