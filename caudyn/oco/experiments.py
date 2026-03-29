@@ -7,6 +7,7 @@ import pandas as pd
 from sklearn.linear_model import Ridge
 
 from .linucb_agents import FastLinUCBAgent, LinUCBAgent
+from .lints_agents import FastLinTSAgent, LinTSAgent
 
 try:
     from environment import (
@@ -245,6 +246,7 @@ def run_agent_simulation(
 
 
 def run_multi_seed_comparison(
+    agent_configs=None,
     seeds=None,
     n_steps=15000,
     progress_every=5000,
@@ -255,49 +257,58 @@ def run_multi_seed_comparison(
     prior_thetas=None,
     prior_weight=1.0,
 ):
-    """Runs both algorithms across multiple seeds and returns aggregated results."""
+    """Runs one or more algorithms across multiple seeds and returns aggregated results.
+
+    Args:
+        agent_configs: Optional dict of
+            {"display_name": {"class": AgentClass, "kwargs": {...}}}.
+            If omitted, defaults to the classic two-agent LinUCB benchmark.
+        original_kwargs: Backward-compatible kwargs for LinUCBAgent default config.
+        fast_kwargs: Backward-compatible kwargs for FastLinUCBAgent default config.
+    """
     if seeds is None:
         seeds = [100, 101, 102, 103, 104]
     if env_kwargs is None:
         env_kwargs = {}
-    if original_kwargs is None:
-        original_kwargs = {"alpha": 0.5}
-    if fast_kwargs is None:
-        fast_kwargs = {"alpha": 0.5, "gamma": 0.995}
 
-    original_runs = []
-    fast_runs = []
+    if agent_configs is None:
+        if original_kwargs is None:
+            original_kwargs = {"alpha": 0.5}
+        if fast_kwargs is None:
+            fast_kwargs = {"alpha": 0.5, "gamma": 0.995}
+
+        agent_configs = {
+            "original": {"class": LinUCBAgent, "kwargs": original_kwargs},
+            "fast": {"class": FastLinUCBAgent, "kwargs": fast_kwargs},
+        }
+
+    all_runs = {agent_name: [] for agent_name in agent_configs.keys()}
 
     print("\n" + "=" * 70)
-    print(f"MULTI-SEED BENCHMARK: {len(seeds)} seeds")
+    print(f"MULTI-SEED BENCHMARK: {len(seeds)} seeds, {len(agent_configs)} agents")
     print("=" * 70)
 
     for run_idx, seed in enumerate(seeds, start=1):
         print(f"\n[Seed {run_idx}/{len(seeds)}] env_seed={seed}")
-        original_result = run_agent_simulation(
-            LinUCBAgent,
-            env_seed=seed,
-            n_steps=n_steps,
-            progress_every=progress_every,
-            env_class=env_class,
-            env_kwargs=env_kwargs,
-            prior_thetas=prior_thetas,
-            prior_weight=prior_weight,
-            **original_kwargs,
-        )
-        fast_result = run_agent_simulation(
-            FastLinUCBAgent,
-            env_seed=seed,
-            n_steps=n_steps,
-            progress_every=progress_every,
-            env_class=env_class,
-            env_kwargs=env_kwargs,
-            prior_thetas=prior_thetas,
-            prior_weight=prior_weight,
-            **fast_kwargs,
-        )
-        original_runs.append(original_result)
-        fast_runs.append(fast_result)
+        for agent_name, config in agent_configs.items():
+            if "class" not in config:
+                raise ValueError(
+                    f"agent_configs['{agent_name}'] must contain a 'class' entry"
+                )
+
+            result = run_agent_simulation(
+                agent_class=config["class"],
+                env_seed=seed,
+                n_steps=n_steps,
+                progress_every=progress_every,
+                env_class=env_class,
+                env_kwargs=env_kwargs,
+                prior_thetas=prior_thetas,
+                prior_weight=prior_weight,
+                **config.get("kwargs", {}),
+            )
+            result["agent_name"] = agent_name
+            all_runs[agent_name].append(result)
 
     def _aggregate_scalar_metric(runs, metric_name):
         values = np.array([run[metric_name] for run in runs], dtype=float)
@@ -307,35 +318,37 @@ def run_multi_seed_comparison(
             "values": values,
         }
 
-    summary = {
-        "avg_conversion": {
-            "original": _aggregate_scalar_metric(original_runs, "avg_conversion"),
-            "fast": _aggregate_scalar_metric(fast_runs, "avg_conversion"),
-        },
-        "cumulative_regret": {
-            "original": _aggregate_scalar_metric(original_runs, "cumulative_regret"),
-            "fast": _aggregate_scalar_metric(fast_runs, "cumulative_regret"),
-        },
-        "final_rmse": {
-            "original": _aggregate_scalar_metric(original_runs, "final_rmse"),
-            "fast": _aggregate_scalar_metric(fast_runs, "final_rmse"),
-        },
-        "runtime_seconds": {
-            "original": _aggregate_scalar_metric(original_runs, "runtime_seconds"),
-            "fast": _aggregate_scalar_metric(fast_runs, "runtime_seconds"),
-        },
-    }
+    metrics_to_aggregate = [
+        "avg_conversion",
+        "cumulative_regret",
+        "final_rmse",
+        "runtime_seconds",
+    ]
+    summary = {}
+    for metric in metrics_to_aggregate:
+        summary[metric] = {
+            agent_name: _aggregate_scalar_metric(runs, metric)
+            for agent_name, runs in all_runs.items()
+        }
 
-    return {
+    result_payload = {
         "seeds": list(seeds),
-        "original_runs": original_runs,
-        "fast_runs": fast_runs,
+        "runs": all_runs,
         "summary": summary,
     }
+
+    # Backward-compatibility for existing reporting helpers and notebooks.
+    if "original" in all_runs:
+        result_payload["original_runs"] = all_runs["original"]
+    if "fast" in all_runs:
+        result_payload["fast_runs"] = all_runs["fast"]
+
+    return result_payload
 
 
 def run_static_warm_start_multi_seed(
     offline_csv_path,
+    agent_configs=None,
     seeds=None,
     n_steps=35000,
     progress_every=5000,
@@ -346,7 +359,7 @@ def run_static_warm_start_multi_seed(
     original_kwargs=None,
     fast_kwargs=None,
 ):
-    """Runs multi-seed static-environment comparison with R-learner priors from offline data."""
+    """Runs multi-seed static-environment comparison with optional custom agents."""
     prior_bundle = extract_rlearner_linear_priors_from_csv(
         offline_csv_path=offline_csv_path,
         ridge_alpha=ridge_alpha,
@@ -360,6 +373,7 @@ def run_static_warm_start_multi_seed(
     print(f"   prior_weight: {prior_weight}")
 
     results = run_multi_seed_comparison(
+        agent_configs=agent_configs,
         seeds=seeds,
         n_steps=n_steps,
         progress_every=progress_every,
@@ -375,7 +389,7 @@ def run_static_warm_start_multi_seed(
 
 
 def run_default_demo():
-    """Runs the default static + shock demonstration from the CLI."""
+    """Runs default demos for LinUCB and a generic multi-agent shock benchmark."""
     try:
         from reporting import (
             print_agent_weights,
@@ -469,6 +483,40 @@ def run_default_demo():
     plot_shock_comparison(
         shock_result_original, shock_result_fast, shock_step=shock_step
     )
+
+    print("\n" + "=" * 70)
+    print("GENERIC BENCHMARK: Fast LinUCB vs Fast LinTS (single seed)")
+    print("=" * 70)
+
+    generic_results = run_multi_seed_comparison(
+        agent_configs={
+            "Fast LinUCB": {
+                "class": FastLinUCBAgent,
+                "kwargs": {"alpha": 0.5, "gamma": 0.995},
+            },
+            "Fast LinTS": {
+                "class": FastLinTSAgent,
+                "kwargs": {"v_squared": 0.1, "gamma": 0.995},
+            },
+            "LinTS": {
+                "class": LinTSAgent,
+                "kwargs": {"v_squared": 0.1},
+            },
+        },
+        seeds=[100],
+        n_steps=n_steps_shock,
+        progress_every=5000,
+        env_class=UberMarketplaceEnvironmentWithShock,
+        env_kwargs={"shock_step": shock_step},
+    )
+
+    print("\n6. Generic Multi-Agent Summary (single-seed statistics):")
+    for metric_name, metric_values in generic_results["summary"].items():
+        print(f"   {metric_name}:")
+        for agent_name, stats in metric_values.items():
+            print(
+                f"      {agent_name:<16} mean={stats['mean']:.4f}, std={stats['std']:.4f}"
+            )
 
 
 if __name__ == "__main__":

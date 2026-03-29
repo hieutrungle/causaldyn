@@ -1,4 +1,5 @@
 from .linucb_agents import LinUCBAgent, FastLinUCBAgent
+from .lints_agents import LinTSAgent, FastLinTSAgent
 from .experiments import (
     extract_rlearner_linear_priors_from_csv,
     run_agent_simulation,

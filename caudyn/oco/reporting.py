@@ -3,6 +3,23 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 
+def _extract_runs_map(multi_seed_result):
+    """Returns a normalized agent->runs mapping from new or legacy payloads."""
+    runs = multi_seed_result.get("runs")
+    if isinstance(runs, dict) and runs:
+        return runs
+
+    runs = {}
+    if "original_runs" in multi_seed_result:
+        runs["original"] = multi_seed_result["original_runs"]
+    if "fast_runs" in multi_seed_result:
+        runs["fast"] = multi_seed_result["fast_runs"]
+
+    if not runs:
+        raise ValueError("Expected multi_seed_result to contain 'runs' or legacy run keys")
+    return runs
+
+
 def print_agent_weights(simulation_result):
     """Prints learned linear weights per action for one simulation result."""
     agent = simulation_result["agent"]
@@ -240,34 +257,42 @@ def plot_shock_comparison(original_result, fast_result, shock_step=17500):
 
 
 def print_multi_seed_summary(multi_seed_result):
-    """Prints scalar mean/std summary for multi-seed runs."""
+    """Prints scalar mean/std summary for one or more multi-seed runs."""
     summary = multi_seed_result["summary"]
-
-    def _row(metric_key, label):
-        orig = summary[metric_key]["original"]
-        fast = summary[metric_key]["fast"]
-        print(
-            f"   {label:<24} "
-            f"{orig['mean']:.4f} +- {orig['std']:.4f}    "
-            f"{fast['mean']:.4f} +- {fast['std']:.4f}"
-        )
+    runs_map = _extract_runs_map(multi_seed_result)
+    agent_names = list(runs_map.keys())
 
     print("\nMulti-Seed Summary (mean +- std)")
     print(f"   Seeds: {multi_seed_result['seeds']}")
-    print("   Metric                    Original                 Fast")
-    _row("avg_conversion", "Avg Conversion")
-    _row("cumulative_regret", "Cumulative Regret")
-    _row("final_rmse", "Final RMSE")
-    _row("runtime_seconds", "Runtime (seconds)")
+    for metric_key, label in [
+        ("avg_conversion", "Avg Conversion"),
+        ("cumulative_regret", "Cumulative Regret"),
+        ("final_rmse", "Final RMSE"),
+        ("runtime_seconds", "Runtime (seconds)"),
+    ]:
+        print(f"   {label}:")
+        for agent_name in agent_names:
+            stats = summary[metric_key][agent_name]
+            print(
+                f"      {agent_name:<20} {stats['mean']:.4f} +- {stats['std']:.4f}"
+            )
 
 
-def plot_multi_seed_comparison(multi_seed_result):
-    """Plots mean +- std trajectories across seeds for both algorithms."""
-    original_color = "tab:blue"
-    fast_color = "tab:orange"
+def plot_multi_seed_comparison(multi_seed_result, ylim_dict=None):
+    """Plots mean +- std trajectories across seeds for one or more algorithms.
 
-    original_runs = multi_seed_result["original_runs"]
-    fast_runs = multi_seed_result["fast_runs"]
+    Args:
+        multi_seed_result: Result payload from run_multi_seed_comparison.
+        ylim_dict: Optional dict mapping metric name to (ymin, ymax) tuple.
+            Valid keys: "conversion", "regret", "mse".
+            Example: {"conversion": (0.1, 0.5), "mse": (0, 0.3)}
+    """
+    runs_map = _extract_runs_map(multi_seed_result)
+    agent_names = list(runs_map.keys())
+    cmap = plt.get_cmap("tab10")
+
+    if ylim_dict is None:
+        ylim_dict = {}
 
     def cumulative_average(data):
         arr = np.asarray(data, dtype=float)
@@ -279,170 +304,80 @@ def plot_multi_seed_comparison(multi_seed_result):
         matrix = np.vstack(series_list)
         return np.mean(matrix, axis=0), np.std(matrix, axis=0)
 
-    original_conv_mean, original_conv_std = mean_std_band(
-        [cumulative_average(run["reward_history"]) for run in original_runs]
-    )
-    fast_conv_mean, fast_conv_std = mean_std_band(
-        [cumulative_average(run["reward_history"]) for run in fast_runs]
-    )
-
-    original_regret_mean, original_regret_std = mean_std_band(
-        [run["regret_history"] for run in original_runs]
-    )
-    fast_regret_mean, fast_regret_std = mean_std_band(
-        [run["regret_history"] for run in fast_runs]
-    )
-
-    original_mse_mean, original_mse_std = mean_std_band(
-        [run["mse_history"] for run in original_runs]
-    )
-    fast_mse_mean, fast_mse_std = mean_std_band(
-        [run["mse_history"] for run in fast_runs]
-    )
-
-    x_conv = np.arange(len(original_conv_mean))
-    x_regret = np.arange(len(original_regret_mean))
-    x_mse = np.arange(len(original_mse_mean))
+    metric_specs = [
+        (
+            "Cumulative Average Conversion",
+            "Conversion Across Seeds",
+            lambda run: cumulative_average(run["reward_history"]),
+            "conversion",
+        ),
+        (
+            "Cumulative Regret",
+            "Regret Across Seeds",
+            lambda run: run["regret_history"],
+            "regret",
+        ),
+        (
+            "MSE",
+            "Prediction MSE Across Seeds",
+            lambda run: run["mse_history"],
+            "mse",
+        ),
+    ]
 
     plt.figure(figsize=(18, 5))
 
-    plt.subplot(1, 3, 1)
-    plt.plot(
-        x_conv, original_conv_mean, label="Original LinUCB Mean", color=original_color
-    )
-    plt.fill_between(
-        x_conv,
-        original_conv_mean - original_conv_std,
-        original_conv_mean + original_conv_std,
-        color=original_color,
-        alpha=0.2,
-        label="Original +-1 std",
-    )
-    plt.plot(x_conv, fast_conv_mean, label="Fast LinUCB Mean", color=fast_color)
-    plt.fill_between(
-        x_conv,
-        fast_conv_mean - fast_conv_std,
-        fast_conv_mean + fast_conv_std,
-        color=fast_color,
-        alpha=0.2,
-        label="Fast +-1 std",
-    )
-    plt.xlabel("Steps")
-    plt.ylabel("Cumulative Average Conversion")
-    plt.title("Conversion Across Seeds")
-    plt.legend()
+    for subplot_idx, (y_label, title, extractor, metric_key) in enumerate(metric_specs, start=1):
+        plt.subplot(1, 3, subplot_idx)
+        for idx, agent_name in enumerate(agent_names):
+            series_list = [extractor(run) for run in runs_map[agent_name]]
+            mean, std = mean_std_band(series_list)
+            x = np.arange(len(mean))
+            color = cmap(idx % 10)
 
-    plt.subplot(1, 3, 2)
-    plt.plot(
-        x_regret,
-        original_regret_mean,
-        label="Original LinUCB Mean",
-        color=original_color,
-    )
-    plt.fill_between(
-        x_regret,
-        original_regret_mean - original_regret_std,
-        original_regret_mean + original_regret_std,
-        color=original_color,
-        alpha=0.2,
-    )
-    plt.plot(x_regret, fast_regret_mean, label="Fast LinUCB Mean", color=fast_color)
-    plt.fill_between(
-        x_regret,
-        fast_regret_mean - fast_regret_std,
-        fast_regret_mean + fast_regret_std,
-        color=fast_color,
-        alpha=0.2,
-    )
-    plt.xlabel("Steps")
-    plt.ylabel("Cumulative Regret")
-    plt.title("Regret Across Seeds")
-    plt.legend()
+            plt.plot(x, mean, label=f"{agent_name} Mean", color=color)
+            plt.fill_between(x, mean - std, mean + std, color=color, alpha=0.2)
 
-    plt.subplot(1, 3, 3)
-    plt.plot(
-        x_mse, original_mse_mean, label="Original LinUCB Mean", color=original_color
-    )
-    plt.fill_between(
-        x_mse,
-        original_mse_mean - original_mse_std,
-        original_mse_mean + original_mse_std,
-        color=original_color,
-        alpha=0.2,
-    )
-    plt.plot(x_mse, fast_mse_mean, label="Fast LinUCB Mean", color=fast_color)
-    plt.fill_between(
-        x_mse,
-        fast_mse_mean - fast_mse_std,
-        fast_mse_mean + fast_mse_std,
-        color=fast_color,
-        alpha=0.2,
-    )
-    plt.xlabel("Steps")
-    plt.ylabel("MSE")
-    plt.title("Prediction MSE Across Seeds")
-    plt.legend()
+        plt.xlabel("Steps")
+        plt.ylabel(y_label)
+        plt.title(title)
+        plt.legend()
+
+        if metric_key in ylim_dict:
+            plt.ylim(ylim_dict[metric_key])
 
     plt.tight_layout()
     plt.show()
 
 
 def plot_multi_seed_shock_comparison(
-    multi_seed_result, shock_step, rolling_window=1000
+    multi_seed_result, shock_step, rolling_window=1000, ylim_dict=None
 ):
-    """Plots shock scenario mean +- std across seeds for both algorithms."""
-    original_color = "tab:blue"
-    fast_color = "tab:orange"
+    """Plots shock scenario mean +- std across seeds for one or more algorithms.
+    
+    Args:
+        multi_seed_result: Result payload from run_multi_seed_comparison.
+        shock_step: Step where shock occurs in the environment.
+        rolling_window: Window size for rolling average.
+        ylim_dict: Optional dict mapping subplot names to (ymin, ymax) tuples.
+            Valid keys: "conversion", "regret", "mse".
+            Example: {"conversion": (0.1, 0.5)}
+    """
     shock_color = "violet"
+    runs_map = _extract_runs_map(multi_seed_result)
+    agent_names = list(runs_map.keys())
+    cmap = plt.get_cmap("tab10")
 
-    original_runs = multi_seed_result["original_runs"]
-    fast_runs = multi_seed_result["fast_runs"]
+    if ylim_dict is None:
+        ylim_dict = {}
 
     def mean_std_band(series_list):
         matrix = np.vstack(series_list)
         return np.mean(matrix, axis=0), np.std(matrix, axis=0)
 
-    original_conv_mean, original_conv_std = mean_std_band(
-        [
-            split_rolling_average(run["reward_history"], shock_step, rolling_window)
-            for run in original_runs
-        ]
-    )
-    fast_conv_mean, fast_conv_std = mean_std_band(
-        [
-            split_rolling_average(run["reward_history"], shock_step, rolling_window)
-            for run in fast_runs
-        ]
-    )
-    oracle_conv_mean, oracle_conv_std = mean_std_band(
-        [
-            split_rolling_average(
-                run["oracle_conversion_history"], shock_step, rolling_window
-            )
-            for run in original_runs
-        ]
-    )
-
-    original_regret_mean, original_regret_std = mean_std_band(
-        [run["regret_history"] for run in original_runs]
-    )
-    fast_regret_mean, fast_regret_std = mean_std_band(
-        [run["regret_history"] for run in fast_runs]
-    )
-
-    original_mse_mean, original_mse_std = mean_std_band(
-        [run["mse_history"] for run in original_runs]
-    )
-    fast_mse_mean, fast_mse_std = mean_std_band(
-        [run["mse_history"] for run in fast_runs]
-    )
-
-    x_conv = np.arange(len(original_conv_mean))
-    x_regret = np.arange(len(original_regret_mean))
-    x_mse = np.arange(len(original_mse_mean))
-
     plt.figure(figsize=(18, 5))
 
+    # Shock conversion subplot
     plt.subplot(1, 3, 1)
     plt.axvline(
         x=shock_step,
@@ -452,46 +387,40 @@ def plot_multi_seed_shock_comparison(
         label="Economic Shock",
         alpha=0.7,
     )
+    for idx, agent_name in enumerate(agent_names):
+        series_list = [
+            split_rolling_average(run["reward_history"], shock_step, rolling_window)
+            for run in runs_map[agent_name]
+        ]
+        mean, std = mean_std_band(series_list)
+        x = np.arange(len(mean))
+        color = cmap(idx % 10)
+        plt.plot(x, mean, label=f"{agent_name} Mean", color=color)
+        plt.fill_between(x, mean - std, mean + std, color=color, alpha=0.2)
+
+    # Oracle reference from the first agent trajectory set.
+    oracle_source_runs = runs_map[agent_names[0]]
+    oracle_mean, oracle_std = mean_std_band(
+        [
+            split_rolling_average(
+                run["oracle_conversion_history"], shock_step, rolling_window
+            )
+            for run in oracle_source_runs
+        ]
+    )
+    x_oracle = np.arange(len(oracle_mean))
     plt.plot(
-        x_conv,
-        original_conv_mean,
-        label=f"Original Mean (rolling={rolling_window})",
-        color=original_color,
-    )
-    plt.fill_between(
-        x_conv,
-        original_conv_mean - original_conv_std,
-        original_conv_mean + original_conv_std,
-        color=original_color,
-        alpha=0.2,
-        label="Original +-1 std",
-    )
-    plt.plot(
-        x_conv,
-        fast_conv_mean,
-        label=f"Fast Mean (rolling={rolling_window})",
-        color=fast_color,
-    )
-    plt.fill_between(
-        x_conv,
-        fast_conv_mean - fast_conv_std,
-        fast_conv_mean + fast_conv_std,
-        color=fast_color,
-        alpha=0.2,
-        label="Fast +-1 std",
-    )
-    plt.plot(
-        x_conv,
-        oracle_conv_mean,
+        x_oracle,
+        oracle_mean,
         label=f"Oracle Mean (rolling={rolling_window})",
         color="black",
         linestyle="--",
         linewidth=1.5,
     )
     plt.fill_between(
-        x_conv,
-        oracle_conv_mean - oracle_conv_std,
-        oracle_conv_mean + oracle_conv_std,
+        x_oracle,
+        oracle_mean - oracle_std,
+        oracle_mean + oracle_std,
         color="black",
         alpha=0.1,
     )
@@ -499,7 +428,11 @@ def plot_multi_seed_shock_comparison(
     plt.ylabel("Average Conversion")
     plt.title("Shock Conversion Across Seeds")
     plt.legend()
+    
+    if "conversion" in ylim_dict:
+        plt.ylim(ylim_dict["conversion"])
 
+    # Shock regret subplot
     plt.subplot(1, 3, 2)
     plt.axvline(
         x=shock_step,
@@ -509,29 +442,22 @@ def plot_multi_seed_shock_comparison(
         label="Economic Shock",
         alpha=0.7,
     )
-    plt.plot(
-        x_regret, original_regret_mean, label="Original Mean", color=original_color
-    )
-    plt.fill_between(
-        x_regret,
-        original_regret_mean - original_regret_std,
-        original_regret_mean + original_regret_std,
-        color=original_color,
-        alpha=0.2,
-    )
-    plt.plot(x_regret, fast_regret_mean, label="Fast Mean", color=fast_color)
-    plt.fill_between(
-        x_regret,
-        fast_regret_mean - fast_regret_std,
-        fast_regret_mean + fast_regret_std,
-        color=fast_color,
-        alpha=0.2,
-    )
+    for idx, agent_name in enumerate(agent_names):
+        series_list = [run["regret_history"] for run in runs_map[agent_name]]
+        mean, std = mean_std_band(series_list)
+        x = np.arange(len(mean))
+        color = cmap(idx % 10)
+        plt.plot(x, mean, label=f"{agent_name} Mean", color=color)
+        plt.fill_between(x, mean - std, mean + std, color=color, alpha=0.2)
     plt.xlabel("Steps")
     plt.ylabel("Cumulative Regret")
     plt.title("Shock Regret Across Seeds")
     plt.legend()
+    
+    if "regret" in ylim_dict:
+        plt.ylim(ylim_dict["regret"])
 
+    # Shock MSE subplot
     plt.subplot(1, 3, 3)
     plt.axvline(
         x=shock_step,
@@ -541,33 +467,32 @@ def plot_multi_seed_shock_comparison(
         label="Economic Shock",
         alpha=0.7,
     )
-    plt.plot(x_mse, original_mse_mean, label="Original Mean", color=original_color)
-    plt.fill_between(
-        x_mse,
-        original_mse_mean - original_mse_std,
-        original_mse_mean + original_mse_std,
-        color=original_color,
-        alpha=0.2,
-    )
-    plt.plot(x_mse, fast_mse_mean, label="Fast Mean", color=fast_color)
-    plt.fill_between(
-        x_mse,
-        fast_mse_mean - fast_mse_std,
-        fast_mse_mean + fast_mse_std,
-        color=fast_color,
-        alpha=0.2,
-    )
+    for idx, agent_name in enumerate(agent_names):
+        series_list = [run["mse_history"] for run in runs_map[agent_name]]
+        mean, std = mean_std_band(series_list)
+        x = np.arange(len(mean))
+        color = cmap(idx % 10)
+        plt.plot(x, mean, label=f"{agent_name} Mean", color=color)
+        plt.fill_between(x, mean - std, mean + std, color=color, alpha=0.2)
     plt.xlabel("Steps")
     plt.ylabel("MSE")
     plt.title("Shock Prediction MSE Across Seeds")
     plt.legend()
+    
+    if "mse" in ylim_dict:
+        plt.ylim(ylim_dict["mse"])
 
     plt.tight_layout()
     plt.show()
 
 
 def plot_cold_vs_warm_start_comparison(cold_start_result, warm_start_result):
-    """Compares cold-start vs warm-start for each algorithm separately."""
+    """Compares cold-start vs warm-start for each shared algorithm key.
+
+    Supports both the new generic payload format:
+        {"runs": {"AgentName": [run1, run2, ...]}, ...}
+    and legacy payloads containing original_runs/fast_runs.
+    """
 
     def cumulative_average(data):
         arr = np.asarray(data, dtype=float)
@@ -579,12 +504,9 @@ def plot_cold_vs_warm_start_comparison(cold_start_result, warm_start_result):
         matrix = np.vstack(series_list)
         return np.mean(matrix, axis=0), np.std(matrix, axis=0)
 
-    def _extract_algorithm_curves(multi_seed_result, algo_key):
-        runs = (
-            multi_seed_result["original_runs"]
-            if algo_key == "original"
-            else multi_seed_result["fast_runs"]
-        )
+    def _extract_algorithm_curves(runs):
+        if not runs:
+            raise ValueError("Expected at least one run to plot cold vs warm comparison")
 
         conv_mean, conv_std = mean_std_band(
             [cumulative_average(run["reward_history"]) for run in runs]
@@ -598,12 +520,20 @@ def plot_cold_vs_warm_start_comparison(cold_start_result, warm_start_result):
             "mse": (mse_mean, mse_std),
         }
 
-    cold_original = _extract_algorithm_curves(cold_start_result, "original")
-    warm_original = _extract_algorithm_curves(warm_start_result, "original")
-    cold_fast = _extract_algorithm_curves(cold_start_result, "fast")
-    warm_fast = _extract_algorithm_curves(warm_start_result, "fast")
+    cold_runs_map = _extract_runs_map(cold_start_result)
+    warm_runs_map = _extract_runs_map(warm_start_result)
 
-    plt.figure(figsize=(18, 10))
+    shared_agent_names = [
+        agent_name for agent_name in cold_runs_map.keys() if agent_name in warm_runs_map
+    ]
+    if not shared_agent_names:
+        raise ValueError(
+            "No shared agent keys found between cold_start_result and warm_start_result"
+        )
+
+    n_agents = len(shared_agent_names)
+    fig_height = max(4 * n_agents, 6)
+    plt.figure(figsize=(18, fig_height))
 
     def _draw_metric_subplot(position, metric_key, ylabel, title, cold_data, warm_data):
         cold_mean, cold_std = cold_data[metric_key]
@@ -636,49 +566,35 @@ def plot_cold_vs_warm_start_comparison(cold_start_result, warm_start_result):
         plt.title(title)
         plt.legend()
 
-    _draw_metric_subplot(
-        1,
-        "conv",
-        "Cumulative Average Conversion",
-        "Original LinUCB: Conversion (Cold vs Warm)",
-        cold_original,
-        warm_original,
-    )
-    _draw_metric_subplot(
-        2,
-        "regret",
-        "Cumulative Regret",
-        "Original LinUCB: Regret (Cold vs Warm)",
-        cold_original,
-        warm_original,
-    )
-    _draw_metric_subplot(
-        3,
-        "mse",
-        "MSE",
-        "Original LinUCB: MSE (Cold vs Warm)",
-        cold_original,
-        warm_original,
-    )
-    _draw_metric_subplot(
-        4,
-        "conv",
-        "Cumulative Average Conversion",
-        "Fast LinUCB: Conversion (Cold vs Warm)",
-        cold_fast,
-        warm_fast,
-    )
-    _draw_metric_subplot(
-        5,
-        "regret",
-        "Cumulative Regret",
-        "Fast LinUCB: Regret (Cold vs Warm)",
-        cold_fast,
-        warm_fast,
-    )
-    _draw_metric_subplot(
-        6, "mse", "MSE", "Fast LinUCB: MSE (Cold vs Warm)", cold_fast, warm_fast
-    )
+    for row_idx, agent_name in enumerate(shared_agent_names):
+        cold_curves = _extract_algorithm_curves(cold_runs_map[agent_name])
+        warm_curves = _extract_algorithm_curves(warm_runs_map[agent_name])
+        base_pos = (row_idx * 3) + 1
+
+        _draw_metric_subplot(
+            base_pos,
+            "conv",
+            "Cumulative Average Conversion",
+            f"{agent_name}: Conversion (Cold vs Warm)",
+            cold_curves,
+            warm_curves,
+        )
+        _draw_metric_subplot(
+            base_pos + 1,
+            "regret",
+            "Cumulative Regret",
+            f"{agent_name}: Regret (Cold vs Warm)",
+            cold_curves,
+            warm_curves,
+        )
+        _draw_metric_subplot(
+            base_pos + 2,
+            "mse",
+            "MSE",
+            f"{agent_name}: MSE (Cold vs Warm)",
+            cold_curves,
+            warm_curves,
+        )
 
     plt.tight_layout()
     plt.show()
