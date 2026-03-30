@@ -4,10 +4,11 @@ import argparse
 import logging
 import warnings
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
+from sklearn.base import clone
 from sklearn.exceptions import ConvergenceWarning
 
 from caudyn.causal.data_utils import (
@@ -33,8 +34,20 @@ from caudyn.causal.metrics import (
 )
 from caudyn.causal.plotting import plot_decile_comparison, plot_qini_comparison
 from caudyn.environment import UberMarketplaceEnvironment
+from caudyn.value_optimization.lp_solver import ValueOptimizer
+from caudyn.value_optimization.unit_selector import UnitSelector
 
 LOGGER = logging.getLogger(__name__)
+
+AVERAGE_RIDE_VALUE = 25.0
+FACE_VALUE_BY_TREATMENT = {
+    0: 0.0,
+    1: 0.10 * AVERAGE_RIDE_VALUE,
+    2: 0.20 * AVERAGE_RIDE_VALUE,
+}
+OPTIMIZATION_BUDGET = 5_000.0
+MU_CLIP_EPS = 1e-6
+OPTIMIZATION_CANDIDATE_TREATMENTS: tuple[int, ...] = (1, 2)
 
 
 @dataclass(frozen=True)
@@ -75,6 +88,141 @@ def _format_int(value: int) -> str:
     return f"{value:,d}"
 
 
+def _prepare_optimization_dataframe(
+    *,
+    df_rct: pd.DataFrame,
+    x_rct: np.ndarray,
+    r_learner: Any,
+    x_train_mu: np.ndarray,
+    y_train_mu: np.ndarray,
+    candidate_treatments: Sequence[int] = OPTIMIZATION_CANDIDATE_TREATMENTS,
+) -> pd.DataFrame:
+    """Build optimization-ready data from holdout predictions.
+
+    This function maps causal outputs into financial optimization inputs expected by
+    UnitSelector and ValueOptimizer, while expanding each rider into multiple
+    candidate promo tiers (e.g., 10% and 20%).
+
+    Notes:
+    - CATE values are predicted directly from a fitted multi-treatment R-Learner.
+    - For each treatment t in `candidate_treatments`, `tau_hat` is the predicted
+      lift of treatment t vs control treatment 0.
+    - Baseline conversion `mu_0` is extracted from the R-Learner outcome model.
+    """
+    mu_0 = _extract_r_learner_mu0(
+        r_learner=r_learner,
+        x_train=x_train_mu,
+        y_train=y_train_mu,
+        x_score=x_rct,
+    )
+    tau_by_treatment = _extract_multi_treatment_cates(
+        r_learner=r_learner,
+        x_score=x_rct,
+        candidate_treatments=candidate_treatments,
+    )
+
+    base = df_rct.copy()
+    base["user_id"] = base.index.astype(int)
+    base["mu_0"] = mu_0
+
+    candidate_frames: list[pd.DataFrame] = []
+    for treatment in candidate_treatments:
+        treatment_int = int(treatment)
+        if treatment_int not in FACE_VALUE_BY_TREATMENT:
+            raise ValueError(f"Treatment {treatment_int} is missing from FACE_VALUE_BY_TREATMENT mapping.")
+
+        candidate = base.copy()
+        candidate["treatment"] = treatment_int
+        candidate["face_value"] = float(FACE_VALUE_BY_TREATMENT[treatment_int])
+        candidate["tau_hat"] = tau_by_treatment[treatment_int]
+        candidate_frames.append(candidate)
+
+    if not candidate_frames:
+        raise ValueError("No optimization candidate treatments were provided.")
+
+    out = pd.concat(candidate_frames, ignore_index=True)
+    return out
+
+
+def _extract_r_learner_mu0(
+    *,
+    r_learner: Any,
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+    x_score: np.ndarray,
+) -> np.ndarray:
+    """Extract baseline conversion mu(x) from the R-learner outcome model.
+
+    CausalML's R-learner stores an outcome learner template (`model_mu`) and uses
+    cross-validation internally for nuisance estimates. To recover a deployable
+    baseline estimate, we fit a clone of that same learner on training data and
+    score the holdout features.
+    """
+    model_mu_template = getattr(r_learner, "model_mu", None)
+    if model_mu_template is None:
+        raise ValueError("R-Learner does not expose an outcome learner template (`model_mu`).")
+
+    model_mu_fitted = clone(model_mu_template)
+    model_mu_fitted.fit(x_train, y_train)
+    mu_0 = np.asarray(model_mu_fitted.predict(x_score), dtype=float).reshape(-1)
+    return np.clip(mu_0, MU_CLIP_EPS, 1.0 - MU_CLIP_EPS)
+
+
+def _extract_multi_treatment_cates(
+    *,
+    r_learner: Any,
+    x_score: np.ndarray,
+    candidate_treatments: Sequence[int],
+) -> dict[int, np.ndarray]:
+    """Extract treatment-specific CATE vectors from a fitted multi-treatment R-Learner."""
+    cates = np.asarray(r_learner.predict(x_score), dtype=float)
+    if cates.ndim == 1:
+        cates = cates.reshape(-1, 1)
+
+    classes = getattr(r_learner, "_classes", None)
+    if not isinstance(classes, Mapping):
+        raise ValueError("R-Learner is missing treatment-class metadata (`_classes`).")
+
+    tau_by_treatment: dict[int, np.ndarray] = {}
+    available_treatments = {int(k) for k in classes.keys()} if classes else set()
+    for treatment in candidate_treatments:
+        treatment_int = int(treatment)
+        if treatment_int not in classes:
+            available = ", ".join(str(k) for k in sorted(available_treatments))
+            raise ValueError(
+                f"Requested treatment {treatment_int} not available in fitted R-Learner classes: {available}."
+            )
+
+        col_idx = int(classes[treatment_int])
+        if col_idx >= cates.shape[1]:
+            raise ValueError(
+                f"Treatment {treatment_int} mapped to invalid column index {col_idx} for CATE matrix "
+                f"with shape {cates.shape}."
+            )
+
+        tau_by_treatment[treatment_int] = cates[:, col_idx].astype(float, copy=False)
+
+    return tau_by_treatment
+
+
+def _fit_multitreatment_r_learner(
+    *,
+    df_hist: pd.DataFrame,
+    features: Sequence[str],
+    random_state: int,
+) -> tuple[Any, np.ndarray, np.ndarray]:
+    """Fit a dedicated multi-treatment R-Learner on 0/10/20 historical data."""
+    x_hist = df_hist[list(features)].to_numpy(dtype=float, copy=True)
+    y_hist = df_hist["converted"].astype(float).to_numpy(copy=True)
+    treatment_hist = df_hist["treatment"].to_numpy(copy=True)
+
+    base_learner = build_base_learner(random_state=random_state)
+    treatment_learner = build_treatment_learner(random_state=random_state)
+    r_learner = initialize_meta_learners(base_learner, treatment_learner)["R-Learner"]
+    r_learner.fit(X=x_hist, treatment=treatment_hist, y=y_hist)
+    return r_learner, x_hist, y_hist
+
+
 def run_experiment(config: ExperimentConfig) -> dict[str, pd.DataFrame]:
     """Execute the full causalml comparison pipeline from data generation to Qini evaluation."""
     # Step 1: Confounding diagnostics on biased logs.
@@ -103,6 +251,13 @@ def run_experiment(config: ExperimentConfig) -> dict[str, pd.DataFrame]:
     treatment_learner = build_treatment_learner(random_state=config.learner_seed)
     learners = initialize_meta_learners(base_learner, treatment_learner)
     learners = fit_meta_learners(learners, x_train, t_train, y_train)
+
+    LOGGER.info("Fitting dedicated multi-treatment R-Learner for optimization candidate scoring (0/10/20).")
+    r_learner_multi, x_hist_multi, y_hist_multi = _fit_multitreatment_r_learner(
+        df_hist=df_hist,
+        features=config.features,
+        random_state=config.learner_seed,
+    )
 
     df_train_bin = add_meta_predictions(df_train_bin, learners, x_train)
     train_summary = summarize_model_predictions(
@@ -219,6 +374,116 @@ def run_experiment(config: ExperimentConfig) -> dict[str, pd.DataFrame]:
     LOGGER.info("\n%s", _format_table(final_comparison, final_percent_cols).to_string(index=False))
     LOGGER.info("Best model by normalized Qini: %s", best_model)
 
+    # Step 6: Offline value optimization on top of causal predictions.
+    _log_section("Step 6 - Offline Value Optimization")
+    df_opt = _prepare_optimization_dataframe(
+        df_rct=df_rct,
+        x_rct=x_rct,
+        r_learner=r_learner_multi,
+        x_train_mu=x_hist_multi,
+        y_train_mu=y_hist_multi,
+        candidate_treatments=OPTIMIZATION_CANDIDATE_TREATMENTS,
+    )
+
+    mu_0_by_user = df_opt.drop_duplicates(subset=["user_id"])["mu_0"]
+    LOGGER.info(
+        "R-Learner mu(x) extracted for optimization (min=%.4f, mean=%.4f, max=%.4f).",
+        float(mu_0_by_user.min()),
+        float(mu_0_by_user.mean()),
+        float(mu_0_by_user.max()),
+    )
+    LOGGER.info(
+        "Optimization CATE source: multi-treatment R-Learner with direct lift estimates vs control for treatments %s.",
+        ", ".join(str(t) for t in OPTIMIZATION_CANDIDATE_TREATMENTS),
+    )
+
+    LOGGER.info(
+        "Optimization input rows prepared: %s users -> %s candidate rows (best eval model=%s).",
+        _format_int(df_rct["treatment"].count()),
+        _format_int(len(df_opt)),
+        best_model,
+    )
+
+    selector = UnitSelector(
+        user_id_col="user_id",
+        treatment_col="treatment",
+        base_prob_col="mu_0",
+        cate_col="tau_hat",
+        cost_col="face_value",
+    )
+    df_selected = selector.fit_transform(df_opt)
+    LOGGER.info(
+        "Unit selection pruning: %s -> %s rows (dropped %s).",
+        _format_int(len(df_opt)),
+        _format_int(len(df_selected)),
+        _format_int(len(df_opt) - len(df_selected)),
+    )
+
+    lambda_val = np.nan
+    df_allocated = df_selected.copy()
+    allocation_summary = pd.DataFrame(
+        {
+            "treatment": [0, 1, 2],
+            "allocated_fraction": [0.0, 0.0, 0.0],
+        }
+    )
+
+    if df_selected.empty:
+        LOGGER.warning("Unit selector returned no positive-lift candidates. Skipping optimization solve.")
+    else:
+        optimizer = ValueOptimizer(
+            budget=OPTIMIZATION_BUDGET,
+            user_col="user_id",
+            cate_col="tau_hat",
+            cost_col="expected_cost",
+        )
+        df_allocated, lambda_val = optimizer.optimize(df_selected)
+
+        allocation_by_treatment = (
+            df_allocated.groupby("treatment")["optimal_fraction"]
+            .sum()
+            .reset_index(name="allocated_fraction")
+        )
+        allocation_summary = (
+            allocation_summary.drop(columns=["allocated_fraction"])
+            .merge(
+                allocation_by_treatment,
+                on="treatment",
+                how="left",
+            )
+            .fillna({"allocated_fraction": 0.0})
+        )
+
+    allocated_10 = float(
+        allocation_summary.loc[allocation_summary["treatment"] == 1, "allocated_fraction"].iloc[0]
+    )
+    allocated_20 = float(
+        allocation_summary.loc[allocation_summary["treatment"] == 2, "allocated_fraction"].iloc[0]
+    )
+    no_discount = max(float(df_opt["user_id"].nunique()) - (allocated_10 + allocated_20), 0.0)
+
+    LOGGER.info(
+        "\n"
+        "=========================================================\n"
+        "       OFFLINE VALUE OPTIMIZATION COMPLETE\n"
+        "=========================================================\n"
+        "Total Budget: $%.2f\n"
+        "Global Shadow Price (Lambda): %.4f\n"
+        "-> This means right at the budget limit, spending $1 buys %.4f incremental rides!\n"
+        "\n"
+        "Allocation Summary:\n"
+        "- Users receiving 10%% Discount: %.2f\n"
+        "- Users receiving 20%% Discount: %.2f\n"
+        "- Users receiving NO Discount: %.2f\n"
+        "=========================================================",
+        OPTIMIZATION_BUDGET,
+        float(lambda_val) if not np.isnan(lambda_val) else float("nan"),
+        float(lambda_val) if not np.isnan(lambda_val) else float("nan"),
+        allocated_10,
+        allocated_20,
+        no_discount,
+    )
+
     return {
         "summary_step1": summary_step1,
         "train_summary": train_summary,
@@ -237,6 +502,21 @@ def run_experiment(config: ExperimentConfig) -> dict[str, pd.DataFrame]:
                 "Rows": [len(frame) for frame in ranked_frames.values()],
             }
         ),
+        "df_opt": df_opt,
+        "df_selected": df_selected,
+        "df_allocated": df_allocated,
+        "allocation_summary": allocation_summary,
+        "optimization_metrics": pd.DataFrame(
+            [
+                {
+                    "budget": OPTIMIZATION_BUDGET,
+                    "lambda": float(lambda_val) if not np.isnan(lambda_val) else np.nan,
+                    "allocated_10pct": allocated_10,
+                    "allocated_20pct": allocated_20,
+                    "allocated_none": no_discount,
+                }
+            ]
+        ),
     }
 
 
@@ -244,8 +524,8 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run the causalml T/X/R learner comparison pipeline on the Uber marketplace simulator."
     )
-    parser.add_argument("--hist-rows", type=int, default=200_000, help="Number of biased historical rows.")
-    parser.add_argument("--rct-rows", type=int, default=20_000, help="Number of randomized holdout rows.")
+    parser.add_argument("--hist-rows", type=int, default=400_000, help="Number of biased historical rows.")
+    parser.add_argument("--rct-rows", type=int, default=100_000, help="Number of randomized holdout rows.")
     parser.add_argument("--hist-seed", type=int, default=42, help="Random seed for historical data generation.")
     parser.add_argument("--rct-seed", type=int, default=999, help="Random seed for RCT holdout generation.")
     parser.add_argument("--learner-seed", type=int, default=42, help="Random seed for XGBoost learners.")
