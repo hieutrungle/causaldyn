@@ -110,6 +110,8 @@ class ValueOptimizer:
             objective_value = float(cast(float, problem.value))
         LOGGER.info("Optimization status: %s", problem.status)
         LOGGER.info("Objective value: %.6f", objective_value)
+        LOGGER.info("Budget used before conversion to integer: %.6f / %.6f", expected_cost @ x.value, self.budget)
+        LOGGER.info("Budget used after conversion to integer: %.6f / %.6f", expected_cost @ optimal_fraction, self.budget)
         LOGGER.info("Extracted budget shadow price lambda: %.6f", shadow_price)
         return out, shadow_price
 
