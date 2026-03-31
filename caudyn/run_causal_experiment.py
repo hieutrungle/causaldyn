@@ -4,7 +4,9 @@ import argparse
 import logging
 import warnings
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -34,6 +36,7 @@ from caudyn.causal.metrics import (
 )
 from caudyn.causal.plotting import plot_decile_comparison, plot_qini_comparison
 from caudyn.environment import UberMarketplaceEnvironment
+from caudyn.simulation import MarketplaceSimulation
 from caudyn.value_optimization.lp_solver import ValueOptimizer
 from caudyn.value_optimization.unit_selector import UnitSelector
 
@@ -48,6 +51,9 @@ FACE_VALUE_BY_TREATMENT = {
 OPTIMIZATION_BUDGET = 5_000.0
 MU_CLIP_EPS = 1e-6
 OPTIMIZATION_CANDIDATE_TREATMENTS: tuple[int, ...] = (1, 2)
+DEFAULT_BASE_LAMBDA = 0.1936
+STEP7_RESULTS_DIR = Path("tmp_results")
+STEP7_TIMESTAMP_FORMAT = "%Y%m%dT%H%M%SZ"
 
 
 @dataclass(frozen=True)
@@ -64,6 +70,13 @@ class ExperimentConfig:
     n_bootstraps: int = 100
     bootstrap_size: int = 5_000
     show_plots: bool = True
+    run_simulation: bool = False
+    simulation_budget: float = OPTIMIZATION_BUDGET
+    simulation_hours: int = 24
+    simulation_seed: int = 2026
+    simulation_min_riders_per_hour: int = 800
+    simulation_max_riders_per_hour: int = 1200
+    simulation_base_lambda: float | None = None
 
 
 def _format_percent(value: object) -> str:
@@ -86,6 +99,49 @@ def _log_section(title: str) -> None:
 
 def _format_int(value: int) -> str:
     return f"{value:,d}"
+
+
+def _build_step7_artifact_paths(*, seed: int, hours: int) -> tuple[Path, Path]:
+    timestamp = datetime.now(timezone.utc).strftime(STEP7_TIMESTAMP_FORMAT)
+    run_tag = f"{timestamp}_seed{seed}_h{hours}"
+    csv_path = STEP7_RESULTS_DIR / f"step7_simulation_summary_{run_tag}.csv"
+    png_path = STEP7_RESULTS_DIR / f"step7_simulation_plot_{run_tag}.png"
+    return csv_path, png_path
+
+
+def _export_step7_artifacts(
+    *,
+    simulation: MarketplaceSimulation,
+    summary_df: pd.DataFrame,
+    seed: int,
+    hours: int,
+    show_plot: bool,
+) -> pd.DataFrame:
+    if summary_df.empty:
+        raise ValueError("Cannot export Step 7 artifacts because simulation_summary is empty.")
+
+    STEP7_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    csv_path, png_path = _build_step7_artifact_paths(seed=seed, hours=hours)
+
+    summary_df.to_csv(csv_path, index=False)
+    simulation.plot_time_series(summary_df=summary_df, show=show_plot, save_path=png_path)
+
+    LOGGER.info("Step 7 artifacts exported under %s", STEP7_RESULTS_DIR.as_posix())
+    LOGGER.info("Step 7 CSV artifact: %s", csv_path.as_posix())
+    LOGGER.info("Step 7 PNG artifact: %s", png_path.as_posix())
+
+    return pd.DataFrame(
+        [
+            {
+                "artifact_type": "step7_simulation_summary",
+                "path": csv_path.as_posix(),
+            },
+            {
+                "artifact_type": "step7_simulation_plot",
+                "path": png_path.as_posix(),
+            },
+        ]
+    )
 
 
 def _prepare_optimization_dataframe(
@@ -158,14 +214,29 @@ def _extract_r_learner_mu0(
     baseline estimate, we fit a clone of that same learner on training data and
     score the holdout features.
     """
+    model_mu_fitted = _fit_r_learner_mu_model(
+        r_learner=r_learner,
+        x_train=x_train,
+        y_train=y_train,
+    )
+    mu_0 = np.asarray(model_mu_fitted.predict(x_score), dtype=float).reshape(-1)
+    return np.clip(mu_0, MU_CLIP_EPS, 1.0 - MU_CLIP_EPS)
+
+
+def _fit_r_learner_mu_model(
+    *,
+    r_learner: Any,
+    x_train: np.ndarray,
+    y_train: np.ndarray,
+) -> Any:
+    """Fit and return a deployable mu(x) model from an R-Learner template."""
     model_mu_template = getattr(r_learner, "model_mu", None)
     if model_mu_template is None:
         raise ValueError("R-Learner does not expose an outcome learner template (`model_mu`).")
 
     model_mu_fitted = clone(model_mu_template)
     model_mu_fitted.fit(x_train, y_train)
-    mu_0 = np.asarray(model_mu_fitted.predict(x_score), dtype=float).reshape(-1)
-    return np.clip(mu_0, MU_CLIP_EPS, 1.0 - MU_CLIP_EPS)
+    return model_mu_fitted
 
 
 def _extract_multi_treatment_cates(
@@ -221,6 +292,50 @@ def _fit_multitreatment_r_learner(
     r_learner = initialize_meta_learners(base_learner, treatment_learner)["R-Learner"]
     r_learner.fit(X=x_hist, treatment=treatment_hist, y=y_hist)
     return r_learner, x_hist, y_hist
+
+
+def _build_online_inference_fn(
+    *,
+    features: Sequence[str],
+    r_learner: Any,
+    mu_model: Any,
+    candidate_treatments: Sequence[int] = OPTIMIZATION_CANDIDATE_TREATMENTS,
+) -> Callable[[pd.DataFrame], pd.DataFrame]:
+    """Create an online inference callable backed by fitted offline models."""
+    feature_cols = [str(col) for col in features]
+    treatment_set = {int(t) for t in candidate_treatments}
+    required_treatments = {1, 2}
+    if not required_treatments.issubset(treatment_set):
+        raise ValueError(
+            "Online simulation requires treatment IDs 1 and 2 in candidate_treatments. "
+            f"Received: {sorted(treatment_set)}"
+        )
+
+    def _inference(riders_df: pd.DataFrame) -> pd.DataFrame:
+        missing_features = [col for col in feature_cols if col not in riders_df.columns]
+        if missing_features:
+            raise ValueError(
+                "Online inference input is missing required feature columns: "
+                + ", ".join(missing_features)
+            )
+
+        scored_df = riders_df.copy()
+        x_score = scored_df[feature_cols].to_numpy(dtype=float, copy=True)
+
+        mu_0 = np.asarray(mu_model.predict(x_score), dtype=float).reshape(-1)
+        scored_df["mu_0"] = np.clip(mu_0, MU_CLIP_EPS, 1.0 - MU_CLIP_EPS)
+
+        tau_by_treatment = _extract_multi_treatment_cates(
+            r_learner=r_learner,
+            x_score=x_score,
+            candidate_treatments=tuple(sorted(treatment_set)),
+        )
+        scored_df["tau_hat_10"] = tau_by_treatment[1]
+        scored_df["tau_hat_20"] = tau_by_treatment[2]
+
+        return scored_df
+
+    return _inference
 
 
 def run_experiment(config: ExperimentConfig) -> dict[str, pd.DataFrame]:
@@ -281,18 +396,32 @@ def run_experiment(config: ExperimentConfig) -> dict[str, pd.DataFrame]:
 
     # Step 3: Randomized holdout and model scoring.
     _log_section("Step 3 - Randomized Holdout (RCT Sandbox)")
-    env_rct, df_rct = generate_randomized_holdout(n_rows=config.rct_rows, seed=config.rct_seed)
+    env_rct, df_rct = generate_randomized_holdout(
+        n_rows=config.rct_rows,
+        seed=config.rct_seed,
+        treatments=(0, 1, 2),
+        treatment_value=2,
+    )
     df_rct = add_oracle_counterfactuals(df_rct, env_rct)
 
-    x_rct = df_rct[list(config.features)].to_numpy(dtype=float, copy=True)
-    df_rct = add_meta_predictions(df_rct, learners, x_rct)
+    x_rct_full = df_rct[list(config.features)].to_numpy(dtype=float, copy=True)
+
+    # Binary-only slice for strict 0 vs 20 validation metrics.
+    df_rct_binary = df_rct[df_rct["treatment"].isin([0, 2])].copy()
+    if df_rct_binary.empty:
+        raise ValueError("Binary RCT slice is empty; cannot run decile or Qini evaluation.")
+    if df_rct_binary["treatment"].nunique() < 2:
+        raise ValueError("Binary RCT slice must contain both treatment 0 and treatment 2 rows.")
+
+    x_rct_binary = df_rct_binary[list(config.features)].to_numpy(dtype=float, copy=True)
+    df_eval = add_meta_predictions(df_rct_binary, learners, x_rct_binary)
 
     holdout_summary = summarize_model_predictions(
-        df=df_rct,
+        df=df_eval,
         learners=learners,
-        x=x_rct,
-        treatment=df_rct["treatment_label"].to_numpy(),
-        y=df_rct["converted"].astype(float).to_numpy(),
+        x=x_rct_binary,
+        treatment=df_eval["treatment_label"].to_numpy(),
+        y=df_eval["converted"].astype(float).to_numpy(),
         label="RCT",
         bootstrap_ci=config.bootstrap_ci,
         n_bootstraps=config.n_bootstraps,
@@ -305,15 +434,20 @@ def run_experiment(config: ExperimentConfig) -> dict[str, pd.DataFrame]:
         "Mean True CATE (RCT)",
     ]
 
-    treatment_share = df_rct["treatment"].value_counts(normalize=True).sort_index().rename("share")
-    LOGGER.info("RCT rows generated: %s", _format_int(len(df_rct)))
-    LOGGER.info("\nTreatment share:\n%s", treatment_share.to_string())
+    treatment_share_full = df_rct["treatment"].value_counts(normalize=True).sort_index().rename("share")
+    treatment_share_binary = (
+        df_eval["treatment"].value_counts(normalize=True).sort_index().rename("share")
+    )
+    LOGGER.info("RCT rows generated (full 0/10/20): %s", _format_int(len(df_rct)))
+    LOGGER.info("\nFull treatment share:\n%s", treatment_share_full.to_string())
+    LOGGER.info("Binary validation rows (0/20): %s", _format_int(len(df_eval)))
+    LOGGER.info("\nBinary treatment share:\n%s", treatment_share_binary.to_string())
     LOGGER.info("\n%s", _format_table(holdout_summary, holdout_percent_cols).to_string(index=False))
 
     # Step 4: Decile ranking validation.
     _log_section("Step 4 - Decile Validation")
     model_score_cols = {model_name: f"pred_cate_{key}" for model_name, key in MODEL_KEY.items()}
-    ranked_frames, decile_tables = build_all_deciles(df_rct, model_score_cols)
+    ranked_frames, decile_tables = build_all_deciles(df_eval, model_score_cols)
 
     for model_name, decile_df in decile_tables.items():
         LOGGER.info(
@@ -323,7 +457,7 @@ def run_experiment(config: ExperimentConfig) -> dict[str, pd.DataFrame]:
         )
 
     ranking_df = summarize_decile_ranking(
-        df=df_rct,
+        df=df_eval,
         decile_tables=decile_tables,
         model_score_cols=model_score_cols,
         true_col="true_cate_20pct",
@@ -341,7 +475,7 @@ def run_experiment(config: ExperimentConfig) -> dict[str, pd.DataFrame]:
     # Step 5: Qini analysis and final comparison.
     _log_section("Step 5 - Qini Curves and Normalized Qini")
     x_axis, qini_random, qini_perfect, qini_curves, qini_results = qini_analysis(
-        df=df_rct,
+        df=df_eval,
         model_score_cols=model_score_cols,
         true_col="true_cate_20pct",
     )
@@ -378,7 +512,7 @@ def run_experiment(config: ExperimentConfig) -> dict[str, pd.DataFrame]:
     _log_section("Step 6 - Offline Value Optimization")
     df_opt = _prepare_optimization_dataframe(
         df_rct=df_rct,
-        x_rct=x_rct,
+        x_rct=x_rct_full,
         r_learner=r_learner_multi,
         x_train_mu=x_hist_multi,
         y_train_mu=y_hist_multi,
@@ -432,7 +566,7 @@ def run_experiment(config: ExperimentConfig) -> dict[str, pd.DataFrame]:
         LOGGER.warning("Unit selector returned no positive-lift candidates. Skipping optimization solve.")
     else:
         optimizer = ValueOptimizer(
-            budget=OPTIMIZATION_BUDGET,
+            budget=config.simulation_budget,
             user_col="user_id",
             cate_col="tau_hat",
             cost_col="expected_cost",
@@ -476,13 +610,70 @@ def run_experiment(config: ExperimentConfig) -> dict[str, pd.DataFrame]:
         "- Users receiving 20%% Discount: %.2f\n"
         "- Users receiving NO Discount: %.2f\n"
         "=========================================================",
-        OPTIMIZATION_BUDGET,
+        config.simulation_budget,
         float(lambda_val) if not np.isnan(lambda_val) else float("nan"),
         float(lambda_val) if not np.isnan(lambda_val) else float("nan"),
         allocated_10,
         allocated_20,
         no_discount,
     )
+
+    simulation_summary = pd.DataFrame()
+    simulation_artifacts = pd.DataFrame(columns=["artifact_type", "path"])
+    if config.run_simulation:
+        _log_section("Step 7 - Online Event Loop Simulation")
+
+        mu_model_online = _fit_r_learner_mu_model(
+            r_learner=r_learner_multi,
+            x_train=x_hist_multi,
+            y_train=y_hist_multi,
+        )
+        online_inference_fn = _build_online_inference_fn(
+            features=config.features,
+            r_learner=r_learner_multi,
+            mu_model=mu_model_online,
+            candidate_treatments=OPTIMIZATION_CANDIDATE_TREATMENTS,
+        )
+
+        if config.simulation_base_lambda is not None:
+            simulation_lambda = float(config.simulation_base_lambda)
+            lambda_source = "cli_override"
+        elif not np.isnan(lambda_val):
+            simulation_lambda = float(lambda_val)
+            lambda_source = "offline_optimizer"
+        else:
+            simulation_lambda = DEFAULT_BASE_LAMBDA
+            lambda_source = "fallback_default"
+
+        LOGGER.info(
+            "Running online simulation with model-backed inference | base_lambda=%.4f (%s) | "
+            "budget=$%.2f | hours=%d | riders/hour=[%d, %d]",
+            simulation_lambda,
+            lambda_source,
+            float(config.simulation_budget),
+            int(config.simulation_hours),
+            int(config.simulation_min_riders_per_hour),
+            int(config.simulation_max_riders_per_hour),
+        )
+
+        simulation = MarketplaceSimulation(
+            total_budget=float(config.simulation_budget),
+            total_hours=int(config.simulation_hours),
+            base_lambda=simulation_lambda,
+            seed=int(config.simulation_seed),
+            min_riders_per_hour=int(config.simulation_min_riders_per_hour),
+            max_riders_per_hour=int(config.simulation_max_riders_per_hour),
+            inference_fn=online_inference_fn,
+        )
+
+        simulation_summary = simulation.run_simulation()
+        simulation_artifacts = _export_step7_artifacts(
+            simulation=simulation,
+            summary_df=simulation_summary,
+            seed=int(config.simulation_seed),
+            hours=int(config.simulation_hours),
+            show_plot=config.show_plots,
+        )
 
     return {
         "summary_step1": summary_step1,
@@ -494,6 +685,7 @@ def run_experiment(config: ExperimentConfig) -> dict[str, pd.DataFrame]:
         "df_hist": df_hist,
         "df_train_bin": df_train_bin,
         "df_rct": df_rct,
+        "df_rct_binary": df_eval,
         "policy_diagnosis": policy_diagnosis,
         "step1_metrics": pd.DataFrame([step1_metrics]),
         "ranked_frames": pd.DataFrame(
@@ -509,7 +701,7 @@ def run_experiment(config: ExperimentConfig) -> dict[str, pd.DataFrame]:
         "optimization_metrics": pd.DataFrame(
             [
                 {
-                    "budget": OPTIMIZATION_BUDGET,
+                    "budget": config.simulation_budget,
                     "lambda": float(lambda_val) if not np.isnan(lambda_val) else np.nan,
                     "allocated_10pct": allocated_10,
                     "allocated_20pct": allocated_20,
@@ -517,6 +709,8 @@ def run_experiment(config: ExperimentConfig) -> dict[str, pd.DataFrame]:
                 }
             ]
         ),
+        "simulation_summary": simulation_summary,
+        "simulation_artifacts": simulation_artifacts,
     }
 
 
@@ -524,7 +718,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run the causalml T/X/R learner comparison pipeline on the Uber marketplace simulator."
     )
-    parser.add_argument("--hist-rows", type=int, default=400_000, help="Number of biased historical rows.")
+    parser.add_argument("--hist-rows", type=int, default=500_000, help="Number of biased historical rows.")
     parser.add_argument("--rct-rows", type=int, default=100_000, help="Number of randomized holdout rows.")
     parser.add_argument("--hist-seed", type=int, default=42, help="Random seed for historical data generation.")
     parser.add_argument("--rct-seed", type=int, default=999, help="Random seed for RCT holdout generation.")
@@ -532,6 +726,31 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--bootstrap-ci", action="store_true", help="Enable bootstrap confidence intervals.")
     parser.add_argument("--n-bootstraps", type=int, default=100, help="Bootstrap iterations for interval estimation.")
     parser.add_argument("--bootstrap-size", type=int, default=5_000, help="Sample size per bootstrap iteration.")
+    parser.add_argument("--run-simulation", action="store_true", help="Run Step 7 online event-loop simulation.")
+    parser.add_argument("--simulation-budget", type=float, default=3_000.0, help="Simulation budget in dollars.")
+    parser.add_argument("--simulation-hours", type=int, default=24, help="Number of simulation epochs (hours).")
+    parser.add_argument("--simulation-seed", type=int, default=2026, help="Random seed for simulation.")
+    parser.add_argument(
+        "--simulation-min-riders",
+        type=int,
+        default=800,
+        help="Minimum number of rider arrivals per simulation hour.",
+    )
+    parser.add_argument(
+        "--simulation-max-riders",
+        type=int,
+        default=1200,
+        help="Maximum number of rider arrivals per simulation hour.",
+    )
+    parser.add_argument(
+        "--simulation-base-lambda",
+        type=float,
+        default=None,
+        help=(
+            "Optional base lambda override for simulation. "
+            "If omitted, uses offline optimizer lambda when available."
+        ),
+    )
     parser.add_argument("--no-plots", action="store_true", help="Disable matplotlib rendering.")
     parser.add_argument("--verbose", action="store_true", help="Enable debug-level logging.")
     return parser.parse_args()
@@ -587,6 +806,13 @@ def main() -> None:
         n_bootstraps=args.n_bootstraps,
         bootstrap_size=args.bootstrap_size,
         show_plots=not args.no_plots,
+        run_simulation=args.run_simulation,
+        simulation_budget=args.simulation_budget,
+        simulation_hours=args.simulation_hours,
+        simulation_seed=args.simulation_seed,
+        simulation_min_riders_per_hour=args.simulation_min_riders,
+        simulation_max_riders_per_hour=args.simulation_max_riders,
+        simulation_base_lambda=args.simulation_base_lambda,
     )
 
     run_experiment(config)
