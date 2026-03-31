@@ -52,9 +52,12 @@ class MarketplaceSimulation:
         self.dispatcher = ThresholdDispatcher(lambda_val=base_lambda)
         self.pacing_controller = PIDPacingController(
             lambda_base=base_lambda,
-            kp=0.005,
-            ki=0.0001,
-            kd=0.0002,
+            # kp=0.005,
+            # ki=0.0001,
+            # kd=0.0002,
+            kp=0.0006,  # Reduced by 10x
+            ki=0.00005,  # Reduced to prevent integral windup on small errors
+            kd=0.00025,  # Keep derivative slightly high to dampen sudden traffic spikes
         )
 
         self.target_spend_curve = [
@@ -78,7 +81,9 @@ class MarketplaceSimulation:
 
     @staticmethod
     def _validate_inference_output(scored_df: pd.DataFrame) -> None:
-        missing_cols = [col for col in REQUIRED_INFERENCE_COLUMNS if col not in scored_df.columns]
+        missing_cols = [
+            col for col in REQUIRED_INFERENCE_COLUMNS if col not in scored_df.columns
+        ]
         if missing_cols:
             raise ValueError(
                 "Inference output is missing required columns: "
@@ -154,20 +159,24 @@ class MarketplaceSimulation:
                 if assigned_treatment in self._treatment_face_values:
                     hourly_spend += self._treatment_face_values[assigned_treatment]
 
-        return hourly_spend, hourly_conversions, treatment_counts, hourly_control_money, hourly_engine_money
+        return (
+            hourly_spend,
+            hourly_conversions,
+            treatment_counts,
+            hourly_control_money,
+            hourly_engine_money,
+        )
 
-    @staticmethod
-    def _print_hourly_header() -> None:
-        print(
+    def _print_hourly_header(self) -> None:
+        self.logger.info(
             "hour | riders | target_spend | actual_spend | conversions | lambda | t0 | t1 | t2"
         )
-        print(
+        self.logger.info(
             "-----+--------+--------------+--------------+-------------+--------+----+----+----"
         )
 
-    @staticmethod
-    def _print_hourly_row(hourly_record: dict[str, float | int]) -> None:
-        print(
+    def _print_hourly_row(self, hourly_record: dict[str, float | int]) -> None:
+        self.logger.info(
             f"{int(hourly_record['hour']):>4d} | "
             f"{int(hourly_record['riders']):>6d} | "
             f"{float(hourly_record['target_spend']):>12.2f} | "
@@ -187,11 +196,20 @@ class MarketplaceSimulation:
             from matplotlib.backends.registry import BackendFilter, backend_registry
 
             interactive_backends = {
-                name.lower() for name in backend_registry.list_builtin(BackendFilter.INTERACTIVE)
+                name.lower()
+                for name in backend_registry.list_builtin(BackendFilter.INTERACTIVE)
             }
             return backend in interactive_backends
         except Exception:
-            non_interactive_backends = {"agg", "cairo", "pdf", "pgf", "ps", "svg", "template"}
+            non_interactive_backends = {
+                "agg",
+                "cairo",
+                "pdf",
+                "pgf",
+                "ps",
+                "svg",
+                "template",
+            }
             return backend not in non_interactive_backends
 
     def plot_time_series(
@@ -218,9 +236,27 @@ class MarketplaceSimulation:
 
         fig, axes = plt.subplots(3, 1, figsize=(13, 12), sharex=True)
 
-        axes[0].plot(hours, target_spend, label="Target cumulative spend", color="#4C78A8", linewidth=2.2)
-        axes[0].plot(hours, actual_spend, label="Actual cumulative spend", color="#F58518", linewidth=2.2)
-        axes[0].axhline(self.total_budget, color="#54A24B", linestyle=":", linewidth=2, label="Total budget")
+        axes[0].plot(
+            hours,
+            target_spend,
+            label="Target cumulative spend",
+            color="#4C78A8",
+            linewidth=2.2,
+        )
+        axes[0].plot(
+            hours,
+            actual_spend,
+            label="Actual cumulative spend",
+            color="#F58518",
+            linewidth=2.2,
+        )
+        axes[0].axhline(
+            self.total_budget,
+            color="#54A24B",
+            linestyle=":",
+            linewidth=2,
+            label="Total budget",
+        )
         axes[0].set_ylabel("Spend")
         axes[0].yaxis.set_major_formatter(mtick.StrMethodFormatter("${x:,.0f}"))
         axes[0].set_title("Budget Pacing Over Time")
@@ -228,7 +264,13 @@ class MarketplaceSimulation:
         axes[0].grid(alpha=0.25)
 
         axes[1].plot(hours, lambda_series, color="#E45756", linewidth=2.2)
-        axes[1].axhline(self.base_lambda, color="#9E9E9E", linestyle="--", linewidth=1.5, label="Base lambda")
+        axes[1].axhline(
+            self.base_lambda,
+            color="#9E9E9E",
+            linestyle="--",
+            linewidth=1.5,
+            label="Base lambda",
+        )
         axes[1].set_ylabel("Lambda")
         axes[1].set_title("Controller Output (Shadow Price)")
         axes[1].legend(loc="best")
@@ -244,7 +286,14 @@ class MarketplaceSimulation:
             alpha=0.85,
         )
         conv_axis = axes[2].twinx()
-        conv_axis.plot(hours, conversions, color="#4C78A8", linewidth=2.0, marker="o", label="Conversions")
+        conv_axis.plot(
+            hours,
+            conversions,
+            color="#4C78A8",
+            linewidth=2.0,
+            marker="o",
+            label="Conversions",
+        )
 
         axes[2].set_ylabel("Assignments")
         conv_axis.set_ylabel("Conversions")
@@ -254,7 +303,9 @@ class MarketplaceSimulation:
 
         handles_left, labels_left = axes[2].get_legend_handles_labels()
         handles_right, labels_right = conv_axis.get_legend_handles_labels()
-        axes[2].legend(handles_left + handles_right, labels_left + labels_right, loc="upper left")
+        axes[2].legend(
+            handles_left + handles_right, labels_left + labels_right, loc="upper left"
+        )
 
         axes[2].set_xticks(hours)
 
@@ -265,7 +316,9 @@ class MarketplaceSimulation:
             output_path = Path(save_path)
             output_path.parent.mkdir(parents=True, exist_ok=True)
             fig.savefig(output_path, dpi=300, bbox_inches="tight")
-            self.logger.info("Saved simulation time-series plot to %s", output_path.as_posix())
+            self.logger.info(
+                "Saved simulation time-series plot to %s", output_path.as_posix()
+            )
 
         if show:
             if self._supports_interactive_show():
@@ -325,7 +378,8 @@ class MarketplaceSimulation:
                 "actual_spend": self._cumulative_actual_spend,
                 "control_money": self._cumulative_control_money,
                 "engine_money": self._cumulative_engine_money,
-                "engine_net_money": self._cumulative_engine_money - self._cumulative_actual_spend,
+                "engine_net_money": self._cumulative_engine_money
+                - self._cumulative_actual_spend,
                 "conversions": conversions,
                 "lambda": new_lambda,
                 "t0": treatment_counts.get(0, 0),
