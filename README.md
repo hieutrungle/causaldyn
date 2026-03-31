@@ -40,28 +40,58 @@ python -m pip install -e ".[dev]"
 
 ## Unified Experiment CLI
 
-Run the full offline causal pipeline:
+Most important workflows:
 
-```bash
-python -m caudyn.run_causal_experiment --hist-rows 1000 --rct-rows 500 --no-plots
-```
-
-Run offline pipeline plus Step 7 online event-loop simulation:
+1. Full pipeline run (Step 1-6)
 
 ```bash
 python -m caudyn.run_causal_experiment \
-  --hist-rows 1000 \
-  --rct-rows 500 \
-  --run-simulation
-```
-
-Recommended simulation override when the offline LP shadow price is near zero:
-
-```bash
-python -m caudyn.run_causal_experiment \
+  --hist-rows 500000 \
+  --rct-rows 100000 \
+  --save-causal-artifacts \
+  --causal-artifacts-dir tmp_models \
   --run-simulation \
-  --simulation-base-lambda 0.1936
+  --simulation-hours 72 \
+  --simulation-budget 10000 \
+  --simulation-min-riders 1600 \
+  --simulation-max-riders 2200
 ```
+
+1. Train + save causal artifacts (cache Step 1-5 to tmp_models)
+
+```bash
+python -m caudyn.run_causal_experiment \
+  --hist-rows 500000 \
+  --rct-rows 100000 \
+  --skip-offline-optimization \
+  --save-causal-artifacts \
+  --causal-artifacts-dir tmp_models
+```
+
+1. Load cached causal artifacts + run offline optimization + simulation (skip Step 1-5 retraining)
+
+```bash
+python -m caudyn.run_causal_experiment \
+  --load-causal-artifacts \
+  --causal-artifacts-dir tmp_models \
+  --run-simulation \
+  --simulation-hours 72 \
+  --simulation-budget 10000 \
+  --simulation-min-riders 1600 \
+  --simulation-max-riders 2200
+```
+
+### Causal Artifact Flags
+
+- --save-causal-artifacts: Save the output of Step 1-5 (run_causal_inference_pipeline) to a local artifact file.
+- --load-causal-artifacts: Load a previously saved Step 1-5 artifact and skip causal retraining.
+- --causal-artifacts-dir: Directory used for saved artifacts (default: tmp_models).
+- --causal-artifact-file: Artifact filename inside the directory (default: causal_pipeline_result.pkl).
+
+### Pipeline Control Flags
+
+- --skip-offline-optimization: Stop after Step 1-5 (and optional save); Step 6 and Step 7 are not executed.
+- --run-simulation: Execute Step 7 after Step 6. This cannot be combined with --skip-offline-optimization.
 
 ### Simulation Controls
 
